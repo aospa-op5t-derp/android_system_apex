@@ -31,7 +31,21 @@ import subprocess
 import sys
 import tempfile
 
+if 'APEXER_TOOL_PATH' not in os.environ:
+  sys.stderr.write("""
+Error. The APEXER_TOOL_PATH environment variable needs to be set, and point to
+a list of directories containing all the tools used by apexer (e.g. mke2fs,
+avbtool, etc.) separated by ':'. Typically this can be set as:
+
+export APEXER_TOOL_PATH="${ANDROID_BUILD_TOP}/out/soong/host/linux-x86/bin:${ANDROID_BUILD_TOP}/prebuilts/sdk/tools/linux/bin"
+
+Aborting.
+""")
+  sys.exit(1)
+
 tool_path = os.environ['APEXER_TOOL_PATH']
+tool_path_list = tool_path.split(":")
+print "Using tool_path_list=" + str(tool_path_list)
 
 def ParseArgs(argv):
   parser = argparse.ArgumentParser(description='Create an APEX file')
@@ -53,12 +67,18 @@ def ParseArgs(argv):
                       help='name of the APEX file')
   return parser.parse_args(argv)
 
+def FindBinaryPath(binary):
+  for path in tool_path_list:
+    binary_path = os.path.join(path, binary)
+    if os.path.exists(binary_path):
+      return binary_path
+  raise Exception("Failed to find binary " + binary + " in path " + tool_path)
 
 def RunCommand(cmd, verbose=False, env=None):
   env = env or {}
   env.update(os.environ.copy())
 
-  cmd[0] = os.path.join(tool_path, cmd[0])
+  cmd[0] = FindBinaryPath(cmd[0])
 
   if verbose:
     print("Running: " + " ".join(cmd))
@@ -203,17 +223,9 @@ def CreateApex(args, work_dir):
   cmd.append(img_file)
   RunCommand(cmd, args.verbose)
 
-  # partition size should be bigger than file system size + size of the hash
-  # tree + size of the vbmeta and the footer.
-  # However, since we don't know the size of the last three before running
-  # avbtool, use an arbitrary big (+100MB) here.
-  # TODO(b/113320014) eliminate this heuristic
-  partition_size = os.stat(img_file).st_size + (100 * 1024 * 1024)
   cmd = ['avbtool']
   cmd.append('add_hashtree_footer')
   cmd.append('--do_not_generate_fec')
-  cmd.extend(['--partition_size', str(partition_size)])
-  cmd.extend(['--partition_name', 'image'])
   cmd.extend(['--algorithm', 'SHA256_RSA4096'])
   cmd.extend(['--key', args.key])
   cmd.extend(['--image', img_file])
