@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -59,6 +60,7 @@ using android::String16;
 using android::apex::ApexService;
 using android::base::Basename;
 using android::base::EndsWith;
+using android::base::ReadFullyAtOffset;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::dm::DeviceMapper;
@@ -73,10 +75,8 @@ static constexpr const char* kApexPackageDataDir = "/data/apex";
 static constexpr const char* kApexPackageSuffix = ".apex";
 static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kApexLoopIdPrefix = "apex:";
-
-// For now, we assume a single key in a known location
-static constexpr const char* kApexDebugKeyFile =
-    "/system/etc/security/apex/apex_debug_key";
+static constexpr const char* kApexKeyDirectory = "/system/etc/security/apex/";
+static constexpr const char* kApexKeyProp = "apex.key";
 
 static constexpr int kVbMetaMaxSize = 64 * 1024;
 
@@ -282,8 +282,12 @@ bool verifyPublicKey(const uint8_t* key, size_t length,
   }
 
   std::streamsize size = pubkeyFile.tellg();
+  if (size < 0) {
+    LOG(ERROR) << "Could not get public key length position";
+    return false;
+  }
 
-  if (size != length) {
+  if (static_cast<size_t>(size) != length) {
     LOG(ERROR) << "Public key length (" << std::to_string(size) << ")"
                << " doesn't equal APEX public key length ("
                << std::to_string(length) << ")";
@@ -302,16 +306,33 @@ bool verifyPublicKey(const uint8_t* key, size_t length,
   return (memcmp(&verifiedKey[0], key, length) == 0);
 }
 
-bool verifyPublicKey(const uint8_t* key, size_t length) {
-#ifdef ALLOW_DEBUG_KEY
-  return verifyPublicKey(key, length, kApexDebugKeyFile);
-#else
-  // This code will be changed significantly; for now, play it safe.
-  (void) key;
-  (void) length;
-  (void) kApexDebugKeyFile;
-  return false;
-#endif
+std::string getPublicKeyFilePath(const ApexFile& apex, const uint8_t* data,
+                                 size_t length) {
+  size_t keyNameLen;
+  const char* keyName = avb_property_lookup(data, length, kApexKeyProp,
+      strlen(kApexKeyProp), &keyNameLen);
+  if (keyName == nullptr || keyNameLen == 0) {
+    LOG(ERROR) << "Cannot find prop \"" << kApexKeyProp << "\" from "
+               << apex.GetPath();
+    return "";
+  }
+
+  std::string keyFilePath(kApexKeyDirectory);
+  keyFilePath.append(keyName, keyNameLen);
+  std::string canonicalKeyFilePath;
+  if (!android::base::Realpath(keyFilePath, &canonicalKeyFilePath)) {
+    LOG(ERROR) << "Failed to get realpath of " << keyFilePath << " error: "
+               << strerror(errno);
+    return "";
+  }
+
+  if (!android::base::StartsWith(canonicalKeyFilePath, kApexKeyDirectory)) {
+    LOG(ERROR) << "Key file " << canonicalKeyFilePath << " is not under "
+               << kApexKeyDirectory;
+    return "";
+  }
+
+  return canonicalKeyFilePath;
 }
 
 bool verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
@@ -342,10 +363,15 @@ bool verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
       return false;
   }
 
+  std::string keyFilePath = getPublicKeyFilePath(apex, data, length);
+  if (keyFilePath == "") {
+    return false;
+  }
+
   // TODO(b/115718846)
   // We need to decide whether we need rollback protection, and whether
   // we can use the rollback protection provided by libavb.
-  if (verifyPublicKey(pk, pk_len)) {
+  if (verifyPublicKey(pk, pk_len, keyFilePath)) {
     LOG(VERBOSE) << apex.GetPath() << ": public key matches.";
     return true;
   } else {
@@ -366,14 +392,7 @@ std::unique_ptr<uint8_t[]> verifyVbMeta(const ApexFile& apex,
   off_t offset = apex.GetImageOffset() + footer.vbmeta_offset;
   std::unique_ptr<uint8_t[]> vbmeta_buf(new uint8_t[footer.vbmeta_size]);
 
-  int ret = lseek(fd, offset, SEEK_SET);
-  if (ret != offset) {
-    PLOG(ERROR) << "Couldn't seek to AVB meta-data.";
-    return nullptr;
-  }
-
-  ret = read(fd, vbmeta_buf.get(), footer.vbmeta_size);
-  if (ret != footer.vbmeta_size) {
+  if (!ReadFullyAtOffset(fd, vbmeta_buf.get(), footer.vbmeta_size, offset)) {
     PLOG(ERROR) << "Couldn't read AVB meta-data.";
     return nullptr;
   }
@@ -492,6 +511,14 @@ std::unique_ptr<ApexVerityData> verifyApexVerity(const ApexFile& apex) {
   return verityData;
 }
 
+void updateSymlink(const std::string& package_name, const std::string& mount_point) {
+  std::string link_path = StringPrintf("%s/%s", kApexRoot, package_name.c_str());
+  LOG(VERBOSE) << "Creating symlink " << link_path << " with target " << mount_point;
+  if (symlink(mount_point.c_str(), link_path.c_str()) != 0) {
+    PLOG(ERROR) << "Can't create symlink " << link_path << " with target " << mount_point;
+  }
+}
+
 void installPackage(const std::string& full_path) {
   LOG(INFO) << "Trying to install " << full_path;
 
@@ -543,6 +570,10 @@ void installPackage(const std::string& full_path) {
             NULL) == 0) {
     LOG(INFO) << "Successfully mounted package " << full_path << " on "
               << mountPoint;
+
+    // TODO: only create symlinks if we are sure we are mounting the latest
+    //       version of a package.
+    updateSymlink(manifest->GetName(), mountPoint);
   } else {
     PLOG(ERROR) << "Mounting failed for package " << full_path;
     // Tear down loop device.
@@ -597,8 +628,8 @@ void scanPackagesDirAndMount(const char* apex_package_dir) {
       std::unique_ptr<DIR, int (*)(DIR*)>(opendir(apex_package_dir), closedir);
 
   if (!d) {
-    LOG(WARNING) << "Package directory " << apex_package_dir
-                 << " not found, nothing to do.";
+    PLOG(WARNING) << "Package directory " << apex_package_dir
+                  << " not found, nothing to do.";
     return;
   }
   struct dirent* dp;

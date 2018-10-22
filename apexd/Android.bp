@@ -1,8 +1,21 @@
 cc_defaults {
   name: "apex_defaults",
   cflags: [
-    "-Wunused",
+    "-Wall",
+    "-Wextra",
+
+    // Some extra flags.
+    "-fstrict-aliasing",
+    "-Wredundant-decls",
+    "-Wshadow",
+    "-Wstrict-aliasing",
+    "-Wthread-safety",
+    "-Wthread-safety-negative",
     "-Wunreachable-code",
+    "-Wunreachable-code-break",
+    "-Wunreachable-code-return",
+    "-Wunused",
+    "-Wused-but-marked-unused",
   ],
   shared_libs: [
     "libbase",
@@ -37,13 +50,6 @@ cc_binary {
     "libdm",
   ],
   init_rc: ["apexd.rc"],
-  product_variables: {
-    debuggable: {
-      cflags: [
-        "-DALLOW_DEBUG_KEY",
-      ],
-    },
-  },
 }
 
 cc_library_static {
@@ -66,13 +72,15 @@ cc_test {
   name: "apex_file_test",
   defaults: ["apex_defaults"],
   data: [
-    "testdata/*",
+    "apexd_testdata/*",
   ],
   srcs: [
     "apex_file_test.cpp",
   ],
   host_supported: true,
   static_libs: ["libapex"],
+  test_suites: ["device-tests"],
+  test_config: "apex_file_test_config.xml",  // TODO: Remove after b/117891984.
 }
 
 cc_test {
@@ -83,4 +91,5 @@ cc_test {
   ],
   host_supported: true,
   static_libs: ["libapex"],
+  test_suites: ["device-tests"],
 }
