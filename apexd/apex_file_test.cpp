@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 #include <android-base/file.h>
+#include <android-base/logging.h>
 #include <gtest/gtest.h>
 #include <string>
 
 #include "apex_file.h"
 
 static std::string testDataDir =
-    android::base::GetExecutableDirectory() + "/testdata";
+    android::base::GetExecutableDirectory() + "/apexd_testdata";
 
 namespace android {
 namespace apex {
@@ -30,7 +31,7 @@ TEST(ApexFileTest, GetOffsetOfSimplePackage) {
   std::unique_ptr<ApexFile> apexFile = ApexFile::Open(filePath);
   ASSERT_NE(nullptr, apexFile.get());
   EXPECT_EQ(4096, apexFile->GetImageOffset());
-  EXPECT_EQ(3608576, apexFile->GetImageSize());
+  EXPECT_EQ(3608576u, apexFile->GetImageSize());
 }
 
 TEST(ApexFileTest, GetOffsetMissingFile) {
@@ -48,3 +49,9 @@ TEST(ApexFileTest, GetApexManifest) {
 }
 }  // namespace apex
 }  // namespace android
+
+int main(int argc, char **argv) {
+  android::base::InitLogging(argv, &android::base::StderrLogger);
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
