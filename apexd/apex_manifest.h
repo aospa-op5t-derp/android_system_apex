@@ -19,20 +19,26 @@
 
 #include <string>
 
+#include <status_or.h>
+
 namespace android {
 namespace apex {
 
 // Parses an APEX manifest on construction and exposes its fields.
 class ApexManifest {
  public:
-  static std::unique_ptr<ApexManifest> Open(const std::string& apex_manifest);
+  static StatusOr<std::unique_ptr<ApexManifest>> Open(
+      const std::string& apex_manifest);
 
   std::string GetName() const { return name_; }
   uint64_t GetVersion() const { return version_; }
+  std::string GetPackageId() const {
+    return name_ + "@" + std::to_string(version_);
+  }
 
  private:
   ApexManifest(const std::string& apex_manifest) : manifest_(apex_manifest){};
-  int OpenInternal();
+  int OpenInternal(std::string* error_msg);
 
   std::string manifest_;
   std::string name_;

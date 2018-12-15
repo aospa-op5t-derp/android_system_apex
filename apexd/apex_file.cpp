@@ -14,22 +14,29 @@
  * limitations under the License.
  */
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <ziparchive/zip_archive.h>
 #include <memory>
 #include <string>
 
 #include "apex_file.h"
+#include "string_log.h"
 
 namespace android {
 namespace apex {
 
-std::unique_ptr<ApexFile> ApexFile::Open(const std::string& apex_filename) {
-  std::unique_ptr<ApexFile> ret(new ApexFile(apex_filename));
-  if (ret->OpenInternal() < 0) {
-    return nullptr;
+StatusOr<std::unique_ptr<ApexFile>> ApexFile::Open(
+    const std::string& apex_path) {
+  std::unique_ptr<ApexFile> ret(new ApexFile(apex_path));
+  std::string error_msg;
+  if (ret->OpenInternal(&error_msg) < 0) {
+    return StatusOr<std::unique_ptr<ApexFile>>::MakeError(error_msg);
   }
-  return ret;
+  return StatusOr<std::unique_ptr<ApexFile>>(std::move(ret));
 }
 
 ApexFile::~ApexFile() {
@@ -41,15 +48,50 @@ ApexFile::~ApexFile() {
 static constexpr const char* kImageFilename = "image.img";
 static constexpr const char* kManifestFilename = "manifest.json";
 
-int ApexFile::OpenInternal() {
+// Tests if <path>/manifest.json file exists.
+static bool isFlattenedApex(const std::string& path) {
+  struct stat buf;
+  const std::string manifest = path + "/" + kManifestFilename;
+  if (stat(manifest.c_str(), &buf) != 0) {
+    if (errno == ENOENT) {
+      return false;
+    }
+    PLOG(ERROR) << "Failed to stat " << path << ". error: " << strerror(errno);
+    return false;
+  }
+
+  if (!S_ISREG(buf.st_mode)) {
+    return false;
+  }
+
+  return true;
+}
+
+int ApexFile::OpenInternal(std::string* error_msg) {
   if (handle_ != nullptr) {
     // Already opened.
     return 0;
   }
-  int ret = OpenArchive(apex_filename_.c_str(), &handle_);
+
+  if (isFlattenedApex(apex_path_)) {
+    image_offset_ = 0;
+    image_size_ = 0;
+    const std::string manifest_path = apex_path_ + "/" + kManifestFilename;
+    if (!android::base::ReadFileToString(manifest_path, &manifest_)) {
+      *error_msg = StringLog()
+                   << "Failed to read manifest file: " << manifest_path;
+      return -1;
+    }
+    flattened_ = true;
+    return 0;
+  }
+
+  flattened_ = false;
+
+  int ret = OpenArchive(apex_path_.c_str(), &handle_);
   if (ret < 0) {
-    LOG(ERROR) << "Failed to open package " << apex_filename_ << ": "
-               << ErrorCodeString(ret);
+    *error_msg = StringLog() << "Failed to open package " << apex_path_ << ": "
+                             << ErrorCodeString(ret);
     return ret;
   }
 
@@ -57,9 +99,9 @@ int ApexFile::OpenInternal() {
   ZipEntry entry;
   ret = FindEntry(handle_, ZipString(kImageFilename), &entry);
   if (ret < 0) {
-    LOG(ERROR) << "Could not find entry \"" << kImageFilename
-               << "\" in package " << apex_filename_ << ": "
-               << ErrorCodeString(ret);
+    *error_msg = StringLog() << "Could not find entry \"" << kImageFilename
+                             << "\" in package " << apex_path_ << ": "
+                             << ErrorCodeString(ret);
     return ret;
   }
   image_offset_ = entry.offset;
@@ -67,9 +109,9 @@ int ApexFile::OpenInternal() {
 
   ret = FindEntry(handle_, ZipString(kManifestFilename), &entry);
   if (ret < 0) {
-    LOG(ERROR) << "Could not find entry \"" << kManifestFilename
-               << "\" in package " << apex_filename_ << ": "
-               << ErrorCodeString(ret);
+    *error_msg = StringLog() << "Could not find entry \"" << kManifestFilename
+                             << "\" in package " << apex_path_ << ": "
+                             << ErrorCodeString(ret);
     return ret;
   }
 
@@ -78,8 +120,8 @@ int ApexFile::OpenInternal() {
   ret = ExtractToMemory(handle_, &entry,
                         reinterpret_cast<uint8_t*>(&(manifest_)[0]), length);
   if (ret != 0) {
-    LOG(ERROR) << "Failed to extract manifest from package " << apex_filename_
-               << ": " << ErrorCodeString(ret);
+    *error_msg = StringLog() << "Failed to extract manifest from package "
+                             << apex_path_ << ": " << ErrorCodeString(ret);
     return ret;
   }
   return 0;

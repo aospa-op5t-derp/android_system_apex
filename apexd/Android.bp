@@ -22,34 +22,68 @@ cc_defaults {
     "libjsoncpp",
     "libziparchive",
   ],
+
+  cpp_std: "c++17",
 }
 
 aidl_interface {
   name: "apex_aidl_interface",
   srcs: [
+    "aidl/android/apex/ApexPackageInfo.aidl",
     "aidl/android/apex/IApexService.aidl",
   ],
   local_include_dir: "aidl",
+  backend: {
+      ndk: {
+          enabled: false,
+      },
+  },
 }
 
 cc_binary {
   name: "apexd",
+  defaults: [
+    "apex_defaults",
+    "libapexservice-deps",
+  ],
+  srcs: ["apexd_main.cpp"],
+  static_libs: [
+    "libapex",
+    "libapexd",
+    "libapexservice",
+    "libavb",
+    "libdm",
+  ],
+  init_rc: ["apexd.rc"],
+}
+
+cc_library_static {
+  name: "libapexd",
   defaults: ["apex_defaults"],
-  srcs: [
-    "apexd.cpp",
-    "apexservice.cpp",
-  ],
-  shared_libs: [
-    "libbinder",
-    "libutils",
-    "apex_aidl_interface-cpp",
-  ],
+  srcs: ["apexd.cpp"],
   static_libs: [
     "libapex",
     "libavb",
     "libdm",
   ],
-  init_rc: ["apexd.rc"],
+}
+
+cc_defaults {
+  name: "libapexservice-deps",
+  shared_libs: [
+    "apex_aidl_interface-cpp",
+    "libbinder",
+    "libutils",
+  ],
+}
+cc_library_static {
+  name: "libapexservice",
+  defaults: [
+    "apex_defaults",
+    "libapexservice-deps",
+  ],
+  srcs: ["apexservice.cpp"],
+  static_libs: ["libapexd"],
 }
 
 cc_library_static {
@@ -92,4 +126,20 @@ cc_test {
   host_supported: true,
   static_libs: ["libapex"],
   test_suites: ["device-tests"],
+}
+
+cc_test {
+  name: "apexservice_test",
+  defaults: ["apex_defaults"],
+  data: ["apexd_testdata/*"],
+  srcs: ["apexservice_test.cpp"],
+  host_supported: false,
+  static_libs: ["apex_aidl_interface-cpp"],
+  shared_libs: [
+    "libbinder",
+    "libselinux",
+    "libutils",
+  ],
+  test_suites: ["device-tests"],
+  test_config: "apexservice_test_config.xml",  // TODO: Remove after b/117891984.
 }

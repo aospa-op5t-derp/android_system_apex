@@ -16,6 +16,20 @@
 
 package android.apex;
 
+import android.apex.ApexPackageInfo;
+
 interface IApexService {
-   boolean installPackage(in @utf8InCpp String package_tmp_path);
+   boolean stagePackage(in @utf8InCpp String package_tmp_path);
+   ApexPackageInfo[] getActivePackages();
+
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void activatePackage(in @utf8InCpp String package_path);
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void deactivatePackage(in @utf8InCpp String package_path);
 }

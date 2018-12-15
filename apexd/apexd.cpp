@@ -16,24 +16,23 @@
 
 #define LOG_TAG "apexd"
 
+#include "apexd.h"
+
 #include "apex_file.h"
 #include "apex_manifest.h"
-#include "apexservice.h"
+#include "status_or.h"
+#include "string_log.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
-#include <binder/IPCThreadState.h>
-#include <binder/IServiceManager.h>
-#include <binder/ProcessState.h>
 #include <libavb/libavb.h>
 #include <libdm/dm.h>
 #include <libdm/dm_table.h>
 #include <libdm/dm_target.h>
-
-#include <utils/String16.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -44,20 +43,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <string>
 
-#include <utils/Errors.h>
-
-using android::defaultServiceManager;
-using android::IPCThreadState;
-using android::ProcessState;
-using android::sp;
-using android::String16;
-using android::apex::ApexService;
 using android::base::Basename;
 using android::base::EndsWith;
 using android::base::ReadFullyAtOffset;
@@ -70,46 +63,86 @@ using android::dm::DmTargetVerity;
 namespace android {
 namespace apex {
 
-static constexpr const char* kApexPackageSystemDir = "/system/apex";
-static constexpr const char* kApexPackageDataDir = "/data/apex";
+namespace {
+
 static constexpr const char* kApexPackageSuffix = ".apex";
-static constexpr const char* kApexRoot = "/apex";
 static constexpr const char* kApexLoopIdPrefix = "apex:";
 static constexpr const char* kApexKeyDirectory = "/system/etc/security/apex/";
 static constexpr const char* kApexKeyProp = "apex.key";
 
+// 128 kB read-ahead, which we currently use for /system as well
+static constexpr const char* kReadAheadKb = "128";
+
+// These should be in-sync with system/sepolicy/public/property_contexts
+static constexpr const char* kApexStatusSysprop = "apexd.status";
+static constexpr const char* kApexStatusStarting = "starting";
+static constexpr const char* kApexStatusReady = "ready";
+
 static constexpr int kVbMetaMaxSize = 64 * 1024;
 
-status_t createLoopDevice(const std::string& target, const int32_t imageOffset,
-                          const size_t imageSize, std::string& out_device) {
+static constexpr int kMkdirMode = 0755;
+
+struct LoopbackDeviceUniqueFd {
+  unique_fd device_fd;
+  std::string name;
+
+  LoopbackDeviceUniqueFd() {}
+  LoopbackDeviceUniqueFd(unique_fd&& fd, const std::string& name)
+      : device_fd(std::move(fd)), name(name) {}
+
+  LoopbackDeviceUniqueFd(LoopbackDeviceUniqueFd&& fd) noexcept
+      : device_fd(std::move(fd.device_fd)), name(fd.name) {}
+  LoopbackDeviceUniqueFd& operator=(LoopbackDeviceUniqueFd&& other) noexcept {
+    MaybeCloseBad();
+    device_fd = std::move(other.device_fd);
+    name = std::move(other.name);
+    return *this;
+  }
+
+  ~LoopbackDeviceUniqueFd() { MaybeCloseBad(); }
+
+  void MaybeCloseBad() {
+    if (device_fd.get() != -1) {
+      // Disassociate any files.
+      if (ioctl(device_fd.get(), LOOP_CLR_FD) == -1) {
+        PLOG(ERROR) << "Unable to clear fd for loopback device";
+      }
+    }
+  }
+
+  void CloseGood() { device_fd.reset(-1); }
+
+  int get() { return device_fd.get(); }
+};
+
+StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
+                                                  const int32_t imageOffset,
+                                                  const size_t imageSize) {
+  using Failed = StatusOr<LoopbackDeviceUniqueFd>;
   unique_fd ctl_fd(open("/dev/loop-control", O_RDWR | O_CLOEXEC));
   if (ctl_fd.get() == -1) {
-    PLOG(ERROR) << "Failed to open loop-control";
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed to open loop-control");
   }
 
   int num = ioctl(ctl_fd.get(), LOOP_CTL_GET_FREE);
   if (num == -1) {
-    PLOG(ERROR) << "Failed LOOP_CTL_GET_FREE";
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed LOOP_CTL_GET_FREE");
   }
 
-  out_device = StringPrintf("/dev/block/loop%d", num);
+  std::string device = StringPrintf("/dev/block/loop%d", num);
 
   unique_fd target_fd(open(target.c_str(), O_RDONLY | O_CLOEXEC));
   if (target_fd.get() == -1) {
-    PLOG(ERROR) << "Failed to open " << target;
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed to open " << target);
   }
-  unique_fd device_fd(open(out_device.c_str(), O_RDWR | O_CLOEXEC));
+  LoopbackDeviceUniqueFd device_fd(
+      unique_fd(open(device.c_str(), O_RDWR | O_CLOEXEC)), device);
   if (device_fd.get() == -1) {
-    PLOG(ERROR) << "Failed to open " << out_device;
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed to open " << device);
   }
 
   if (ioctl(device_fd.get(), LOOP_SET_FD, target_fd.get()) == -1) {
-    PLOG(ERROR) << "Failed to LOOP_SET_FD";
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_FD");
   }
 
   struct loop_info64 li;
@@ -118,8 +151,7 @@ status_t createLoopDevice(const std::string& target, const int32_t imageOffset,
   li.lo_offset = imageOffset;
   li.lo_sizelimit = imageSize;
   if (ioctl(device_fd.get(), LOOP_SET_STATUS64, &li) == -1) {
-    PLOG(ERROR) << "Failed to LOOP_SET_STATUS64";
-    return -errno;
+    return Failed::MakeError(PStringLog() << "Failed to LOOP_SET_STATUS64");
   }
 
   // Direct-IO requires the loop device to have the same block size as the
@@ -134,8 +166,7 @@ status_t createLoopDevice(const std::string& target, const int32_t imageOffset,
     }
   }
 
-
-  return 0;
+  return StatusOr<LoopbackDeviceUniqueFd>(std::move(device_fd));
 }
 
 void destroyAllLoopDevices() {
@@ -183,9 +214,7 @@ void destroyAllLoopDevices() {
   }
 }
 
-static constexpr int kLoopDeviceSetupRetries = 3;
-
-static constexpr const char* kApexServiceName = "apexservice";
+static constexpr size_t kLoopDeviceSetupAttempts = 3u;
 
 std::string bytes_to_hex(const uint8_t* bytes, size_t bytes_len) {
   std::ostringstream s;
@@ -242,8 +271,8 @@ std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
   return table;
 }
 
-std::unique_ptr<AvbFooter> getAvbFooter(const ApexFile& apex,
-                                        const unique_fd& fd) {
+StatusOr<std::unique_ptr<AvbFooter>> getAvbFooter(const ApexFile& apex,
+                                                  const unique_fd& fd) {
   std::array<uint8_t, AVB_FOOTER_SIZE> footer_data;
   auto footer = std::make_unique<AvbFooter>();
 
@@ -251,47 +280,46 @@ std::unique_ptr<AvbFooter> getAvbFooter(const ApexFile& apex,
   off_t offset = apex.GetImageSize() + apex.GetImageOffset() - AVB_FOOTER_SIZE;
   int ret = lseek(fd, offset, SEEK_SET);
   if (ret == -1) {
-    PLOG(ERROR) << "Couldn't seek to AVB footer.";
-    return nullptr;
+    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
+        PStringLog() << "Couldn't seek to AVB footer.");
   }
 
   ret = read(fd, footer_data.data(), AVB_FOOTER_SIZE);
   if (ret != AVB_FOOTER_SIZE) {
-    PLOG(ERROR) << "Couldn't read AVB footer.";
-    return nullptr;
+    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
+        PStringLog() << "Couldn't read AVB footer.");
   }
 
   if (!avb_footer_validate_and_byteswap((const AvbFooter*)footer_data.data(),
                                         footer.get())) {
-    LOG(ERROR) << "AVB footer verification failed.";
-    return nullptr;
+    return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
+        StringLog() << "AVB footer verification failed.");
   }
 
   LOG(VERBOSE) << "AVB footer verification successful.";
-  return footer;
+  return StatusOr<std::unique_ptr<AvbFooter>>(std::move(footer));
 }
 
 // TODO We'll want to cache the verified key to avoid having to read it every
 // time.
-bool verifyPublicKey(const uint8_t* key, size_t length,
-                     std::string acceptedKeyFile) {
+Status verifyPublicKey(const uint8_t* key, size_t length,
+                       std::string acceptedKeyFile) {
   std::ifstream pubkeyFile(acceptedKeyFile, std::ios::binary | std::ios::ate);
   if (pubkeyFile.bad()) {
-    LOG(ERROR) << "Can't open " << acceptedKeyFile;
-    return false;
+    return Status::Fail(StringLog() << "Can't open " << acceptedKeyFile);
   }
 
   std::streamsize size = pubkeyFile.tellg();
   if (size < 0) {
-    LOG(ERROR) << "Could not get public key length position";
-    return false;
+    return Status::Fail(StringLog()
+                        << "Could not get public key length position");
   }
 
   if (static_cast<size_t>(size) != length) {
-    LOG(ERROR) << "Public key length (" << std::to_string(size) << ")"
-               << " doesn't equal APEX public key length ("
-               << std::to_string(length) << ")";
-    return false;
+    return Status::Fail(StringLog()
+                        << "Public key length (" << std::to_string(size) << ")"
+                        << " doesn't equal APEX public key length ("
+                        << std::to_string(length) << ")");
   }
 
   pubkeyFile.seekg(0, std::ios::beg);
@@ -299,44 +327,45 @@ bool verifyPublicKey(const uint8_t* key, size_t length,
   std::string verifiedKey(size, 0);
   pubkeyFile.read(&verifiedKey[0], size);
   if (pubkeyFile.bad()) {
-    LOG(ERROR) << "Can't read from " << acceptedKeyFile;
-    return false;
+    return Status::Fail(StringLog() << "Can't read from " << acceptedKeyFile);
   }
 
-  return (memcmp(&verifiedKey[0], key, length) == 0);
+  if (memcmp(&verifiedKey[0], key, length) != 0) {
+    return Status::Fail("Failed to compare verified key with key");
+  }
+  return Status::Success();
 }
 
-std::string getPublicKeyFilePath(const ApexFile& apex, const uint8_t* data,
-                                 size_t length) {
+StatusOr<std::string> getPublicKeyFilePath(const ApexFile& apex,
+                                           const uint8_t* data, size_t length) {
   size_t keyNameLen;
   const char* keyName = avb_property_lookup(data, length, kApexKeyProp,
-      strlen(kApexKeyProp), &keyNameLen);
+                                            strlen(kApexKeyProp), &keyNameLen);
   if (keyName == nullptr || keyNameLen == 0) {
-    LOG(ERROR) << "Cannot find prop \"" << kApexKeyProp << "\" from "
-               << apex.GetPath();
-    return "";
+    return StatusOr<std::string>::MakeError(
+        StringLog() << "Cannot find prop \"" << kApexKeyProp << "\" from "
+                    << apex.GetPath());
   }
 
   std::string keyFilePath(kApexKeyDirectory);
   keyFilePath.append(keyName, keyNameLen);
   std::string canonicalKeyFilePath;
   if (!android::base::Realpath(keyFilePath, &canonicalKeyFilePath)) {
-    LOG(ERROR) << "Failed to get realpath of " << keyFilePath << " error: "
-               << strerror(errno);
-    return "";
+    return StatusOr<std::string>::MakeError(
+        PStringLog() << "Failed to get realpath of " << keyFilePath);
   }
 
   if (!android::base::StartsWith(canonicalKeyFilePath, kApexKeyDirectory)) {
-    LOG(ERROR) << "Key file " << canonicalKeyFilePath << " is not under "
-               << kApexKeyDirectory;
-    return "";
+    return StatusOr<std::string>::MakeError(
+        StringLog() << "Key file " << canonicalKeyFilePath << " is not under "
+                    << kApexKeyDirectory);
   }
 
-  return canonicalKeyFilePath;
+  return StatusOr<std::string>(canonicalKeyFilePath);
 }
 
-bool verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
-                           size_t length) {
+Status verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
+                             size_t length) {
   const uint8_t* pk;
   size_t pk_len;
   AvbVBMetaVerifyResult res;
@@ -348,64 +377,65 @@ bool verifyVbMetaSignature(const ApexFile& apex, const uint8_t* data,
     case AVB_VBMETA_VERIFY_RESULT_OK_NOT_SIGNED:
     case AVB_VBMETA_VERIFY_RESULT_HASH_MISMATCH:
     case AVB_VBMETA_VERIFY_RESULT_SIGNATURE_MISMATCH:
-      LOG(ERROR) << "Error verifying " << apex.GetPath() << ": "
-                 << avb_vbmeta_verify_result_to_string(res);
-      return false;
+      return Status::Fail(StringLog()
+                          << "Error verifying " << apex.GetPath() << ": "
+                          << avb_vbmeta_verify_result_to_string(res));
     case AVB_VBMETA_VERIFY_RESULT_INVALID_VBMETA_HEADER:
-      LOG(ERROR) << "Error verifying " << apex.GetPath() << ": "
-                 << "invalid vbmeta header";
-      return false;
+      return Status::Fail(StringLog()
+                          << "Error verifying " << apex.GetPath() << ": "
+                          << "invalid vbmeta header");
     case AVB_VBMETA_VERIFY_RESULT_UNSUPPORTED_VERSION:
-      LOG(ERROR) << "Error verifying " << apex.GetPath() << ": "
-                 << "unsupported version";
-      return false;
+      return Status::Fail(StringLog()
+                          << "Error verifying " << apex.GetPath() << ": "
+                          << "unsupported version");
     default:
-      return false;
+      return Status::Fail("Unknown vmbeta_image_verify return value");
   }
 
-  std::string keyFilePath = getPublicKeyFilePath(apex, data, length);
-  if (keyFilePath == "") {
-    return false;
+  StatusOr<std::string> keyFilePath = getPublicKeyFilePath(apex, data, length);
+  if (!keyFilePath.Ok()) {
+    return keyFilePath.ErrorStatus();
   }
 
   // TODO(b/115718846)
   // We need to decide whether we need rollback protection, and whether
   // we can use the rollback protection provided by libavb.
-  if (verifyPublicKey(pk, pk_len, keyFilePath)) {
+  Status st = verifyPublicKey(pk, pk_len, *keyFilePath);
+  if (st.Ok()) {
     LOG(VERBOSE) << apex.GetPath() << ": public key matches.";
-    return true;
-  } else {
-    LOG(ERROR) << "Error verifying " << apex.GetPath() << ": "
-               << "couldn't verify public key.";
-    return false;
+    return st;
   }
+  return Status::Fail(StringLog()
+                      << "Error verifying " << apex.GetPath() << ": "
+                      << "couldn't verify public key: " << st.ErrorMessage());
 }
 
-std::unique_ptr<uint8_t[]> verifyVbMeta(const ApexFile& apex,
-                                        const unique_fd& fd,
-                                        const AvbFooter& footer) {
+StatusOr<std::unique_ptr<uint8_t[]>> verifyVbMeta(const ApexFile& apex,
+                                                  const unique_fd& fd,
+                                                  const AvbFooter& footer) {
   if (footer.vbmeta_size > kVbMetaMaxSize) {
-    LOG(ERROR) << "VbMeta size in footer exceeds kVbMetaMaxSize.";
-    return nullptr;
+    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(
+        "VbMeta size in footer exceeds kVbMetaMaxSize.");
   }
 
   off_t offset = apex.GetImageOffset() + footer.vbmeta_offset;
   std::unique_ptr<uint8_t[]> vbmeta_buf(new uint8_t[footer.vbmeta_size]);
 
   if (!ReadFullyAtOffset(fd, vbmeta_buf.get(), footer.vbmeta_size, offset)) {
-    PLOG(ERROR) << "Couldn't read AVB meta-data.";
-    return nullptr;
+    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(
+        PStringLog() << "Couldn't read AVB meta-data.");
   }
 
-  if (!verifyVbMetaSignature(apex, vbmeta_buf.get(), footer.vbmeta_size)) {
-    return nullptr;
+  Status st = verifyVbMetaSignature(apex, vbmeta_buf.get(), footer.vbmeta_size);
+  if (!st.Ok()) {
+    return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(st.ErrorMessage());
   }
 
-  return vbmeta_buf;
+  return StatusOr<std::unique_ptr<uint8_t[]>>(std::move(vbmeta_buf));
 }
 
-const AvbHashtreeDescriptor* findDescriptor(uint8_t* vbmeta_data,
-                                            size_t vbmeta_size) {
+StatusOr<const AvbHashtreeDescriptor*> findDescriptor(uint8_t* vbmeta_data,
+                                                      size_t vbmeta_size) {
   const AvbDescriptor** descriptors;
   size_t num_descriptors;
 
@@ -415,8 +445,8 @@ const AvbHashtreeDescriptor* findDescriptor(uint8_t* vbmeta_data,
   for (size_t i = 0; i < num_descriptors; i++) {
     AvbDescriptor desc;
     if (!avb_descriptor_validate_and_byteswap(descriptors[i], &desc)) {
-      LOG(ERROR) << "Couldn't validate AvbDescriptor.";
-      return nullptr;
+      return StatusOr<const AvbHashtreeDescriptor*>::MakeError(
+          "Couldn't validate AvbDescriptor.");
     }
 
     if (desc.tag != AVB_DESCRIPTOR_TAG_HASHTREE) {
@@ -424,43 +454,89 @@ const AvbHashtreeDescriptor* findDescriptor(uint8_t* vbmeta_data,
       continue;
     }
 
-    return (const AvbHashtreeDescriptor*)descriptors[i];
+    return StatusOr<const AvbHashtreeDescriptor*>(
+        (const AvbHashtreeDescriptor*)descriptors[i]);
   }
 
-  LOG(ERROR) << "Couldn't find any AVB hashtree descriptors.";
-  return nullptr;
+  return StatusOr<const AvbHashtreeDescriptor*>::MakeError(
+      "Couldn't find any AVB hashtree descriptors.");
 }
 
-std::unique_ptr<AvbHashtreeDescriptor> verifyDescriptor(
+StatusOr<std::unique_ptr<AvbHashtreeDescriptor>> verifyDescriptor(
     const AvbHashtreeDescriptor* desc) {
   auto verifiedDesc = std::make_unique<AvbHashtreeDescriptor>();
 
   if (!avb_hashtree_descriptor_validate_and_byteswap(desc,
                                                      verifiedDesc.get())) {
-    LOG(ERROR) << "Couldn't validate AvbDescriptor.";
-    return nullptr;
+    StatusOr<std::unique_ptr<AvbHashtreeDescriptor>>::MakeError(
+        "Couldn't validate AvbDescriptor.");
   }
 
-  return verifiedDesc;
+  return StatusOr<std::unique_ptr<AvbHashtreeDescriptor>>(
+      std::move(verifiedDesc));
 }
 
-std::string createVerityDevice(const std::string& name, const DmTable& table) {
-  std::string dev_path;
+class DmVerityDevice {
+ public:
+  DmVerityDevice() : cleared_(true) {}
+  DmVerityDevice(const std::string& name) : name_(name), cleared_(false) {}
+  DmVerityDevice(const std::string& name, const std::string& dev_path)
+      : name_(name), dev_path_(dev_path), cleared_(false) {}
+
+  DmVerityDevice(DmVerityDevice&& other)
+      : name_(other.name_),
+        dev_path_(other.dev_path_),
+        cleared_(other.cleared_) {
+    other.cleared_ = true;
+  }
+
+  DmVerityDevice& operator=(DmVerityDevice&& other) {
+    name_ = other.name_;
+    dev_path_ = other.dev_path_;
+    cleared_ = other.cleared_;
+    other.cleared_ = true;
+    return *this;
+  }
+
+  ~DmVerityDevice() {
+    if (!cleared_) {
+      DeviceMapper& dm = DeviceMapper::Instance();
+      dm.DeleteDevice(name_);
+    }
+  }
+
+  const std::string& GetName() const { return name_; }
+  const std::string& GetDevPath() const { return dev_path_; }
+  void SetDevPath(const std::string& dev_path) { dev_path_ = dev_path; }
+
+  void Release() { cleared_ = true; }
+
+ private:
+  std::string name_;
+  std::string dev_path_;
+  bool cleared_;
+};
+
+StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
+                                            const DmTable& table) {
   DeviceMapper& dm = DeviceMapper::Instance();
 
   dm.DeleteDevice(name);
 
   if (!dm.CreateDevice(name, table)) {
-    LOG(ERROR) << "Couldn't create verity device.";
-    return {};
+    return StatusOr<DmVerityDevice>::MakeError(
+        "Couldn't create verity device.");
   }
+  DmVerityDevice dev(name);
 
+  std::string dev_path;
   if (!dm.GetDmDevicePathByName(name, &dev_path)) {
-    LOG(ERROR) << "Couldn't get verity device path!";
-    return {};
+    return StatusOr<DmVerityDevice>::MakeError(
+        "Couldn't get verity device path!");
   }
+  dev.SetDevPath(dev_path);
 
-  return dev_path;
+  return StatusOr<DmVerityDevice>(std::move(dev));
 }
 
 // What this function verifies
@@ -472,122 +548,373 @@ std::string createVerityDevice(const std::string& name, const DmTable& table) {
 // If all these steps pass, this function returns an ApexVerityTable
 // struct with all the data necessary to create a dm-verity device for this
 // APEX.
-std::unique_ptr<ApexVerityData> verifyApexVerity(const ApexFile& apex) {
+StatusOr<std::unique_ptr<ApexVerityData>> verifyApexVerity(
+    const ApexFile& apex) {
   auto verityData = std::make_unique<ApexVerityData>();
 
   unique_fd fd(open(apex.GetPath().c_str(), O_RDONLY | O_CLOEXEC));
   if (fd.get() == -1) {
-    PLOG(ERROR) << "Failed to open " << apex.GetPath();
-    return nullptr;
+    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
+        PStringLog() << "Failed to open " << apex.GetPath());
   }
 
-  std::unique_ptr<AvbFooter> footer = getAvbFooter(apex, fd);
-  if (!footer) {
-    return nullptr;
+  StatusOr<std::unique_ptr<AvbFooter>> footer = getAvbFooter(apex, fd);
+  if (!footer.Ok()) {
+    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
+        footer.ErrorMessage());
   }
 
-  std::unique_ptr<uint8_t[]> vbmeta_data = verifyVbMeta(apex, fd, *footer);
-  if (!vbmeta_data) {
-    return nullptr;
+  StatusOr<std::unique_ptr<uint8_t[]>> vbmeta_data =
+      verifyVbMeta(apex, fd, **footer);
+  if (!vbmeta_data.Ok()) {
+    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
+        vbmeta_data.ErrorMessage());
   }
 
-  const AvbHashtreeDescriptor* descriptor =
-      findDescriptor(vbmeta_data.get(), footer->vbmeta_size);
-  if (!descriptor) {
-    return nullptr;
+  StatusOr<const AvbHashtreeDescriptor*> descriptor =
+      findDescriptor(vbmeta_data->get(), (*footer)->vbmeta_size);
+  if (!descriptor.Ok()) {
+    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
+        descriptor.ErrorMessage());
   }
 
-  verityData->desc = verifyDescriptor(descriptor);
-  if (!verityData->desc) {
-    return nullptr;
+  StatusOr<std::unique_ptr<AvbHashtreeDescriptor>> verifiedDescriptor =
+      verifyDescriptor(*descriptor);
+  if (!verifiedDescriptor.Ok()) {
+    return StatusOr<std::unique_ptr<ApexVerityData>>::MakeError(
+        verifiedDescriptor.ErrorMessage());
   }
+  verityData->desc = std::move(*verifiedDescriptor);
 
   // This area is now safe to access, because we just verified it
   const uint8_t* trailingData =
-      (const uint8_t*)descriptor + sizeof(AvbHashtreeDescriptor);
+      (const uint8_t*)*descriptor + sizeof(AvbHashtreeDescriptor);
   verityData->salt = getSalt(*(verityData->desc), trailingData);
   verityData->root_digest = getDigest(*(verityData->desc), trailingData);
 
-  return verityData;
+  return StatusOr<std::unique_ptr<ApexVerityData>>(std::move(verityData));
 }
 
-void updateSymlink(const std::string& package_name, const std::string& mount_point) {
-  std::string link_path = StringPrintf("%s/%s", kApexRoot, package_name.c_str());
-  LOG(VERBOSE) << "Creating symlink " << link_path << " with target " << mount_point;
-  if (symlink(mount_point.c_str(), link_path.c_str()) != 0) {
-    PLOG(ERROR) << "Can't create symlink " << link_path << " with target " << mount_point;
+Status updateLatest(const std::string& package_name,
+                    const std::string& mount_point) {
+  std::string latest_path =
+      StringPrintf("%s/%s", kApexRoot, package_name.c_str());
+  LOG(VERBOSE) << "Creating bind-mount for " << latest_path << " with target "
+               << mount_point;
+  // Ensure the directory exists, try to unmount.
+  {
+    bool exists;
+    bool is_dir;
+    {
+      struct stat buf;
+      if (stat(latest_path.c_str(), &buf) != 0) {
+        if (errno == ENOENT) {
+          exists = false;
+          is_dir = false;
+        } else {
+          PLOG(ERROR) << "Could not stat target directory " << latest_path;
+          // Still attempt to bind-mount.
+          exists = true;
+          is_dir = true;
+        }
+      } else {
+        exists = true;
+        is_dir = S_ISDIR(buf.st_mode);
+      }
+    }
+
+    // Ensure that it is a folder.
+    if (exists && !is_dir) {
+      LOG(WARNING) << latest_path << " is not a directory, attempting to fix";
+      if (unlink(latest_path.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to unlink " << latest_path;
+        // Try mkdir, anyways.
+      }
+      exists = false;
+    }
+    // And create it if necessary.
+    if (!exists) {
+      LOG(VERBOSE) << "Creating mountpoint " << latest_path;
+      if (mkdir(latest_path.c_str(), kMkdirMode) != 0) {
+        return Status::Fail(PStringLog()
+                            << "Could not create mountpoint " << latest_path);
+      }
+    };
+    // Unmount any active bind-mount.
+    if (exists) {
+      int rc = umount2(latest_path.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH);
+      if (rc != 0 && errno != EINVAL) {
+        // Log error but ignore.
+        PLOG(ERROR) << "Could not unmount " << latest_path;
+      }
+    }
   }
+
+  LOG(VERBOSE) << "Bind-mounting " << mount_point << " to " << latest_path;
+  if (mount(mount_point.c_str(), latest_path.c_str(), nullptr, MS_BIND,
+            nullptr) == 0) {
+    return Status::Success();
+  }
+  return Status::Fail(PStringLog() << "Could not bind-mount " << mount_point
+                                   << " to " << latest_path);
 }
 
-void installPackage(const std::string& full_path) {
-  LOG(INFO) << "Trying to install " << full_path;
-
-  std::unique_ptr<ApexFile> apex = ApexFile::Open(full_path);
-  if (apex.get() == nullptr) {
-    // Error opening the file.
-    return;
+StatusOr<std::vector<std::string>> getApexRootSubFolders() {
+  // This code would be much shorter if C++17's std::filesystem were available,
+  // which is not at the time of writing this.
+  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(kApexRoot), closedir);
+  if (!d) {
+    return StatusOr<std::vector<std::string>>::MakeError(
+        PStringLog() << "Can't open " << kApexRoot << " for reading.");
   }
 
-  std::unique_ptr<ApexManifest> manifest =
-      ApexManifest::Open(apex->GetManifest());
-  if (manifest.get() == nullptr) {
-    // Error parsing manifest.
-    return;
-  }
-  std::string packageId =
-      manifest->GetName() + "@" + std::to_string(manifest->GetVersion());
-
-  std::string loopback;
-  status_t ret;
-  int retries = 0;
-  do {
-    ret = createLoopDevice(full_path, apex->GetImageOffset(),
-                           apex->GetImageSize(), loopback);
-    ++retries;
-  } while (ret != NO_ERROR && retries < kLoopDeviceSetupRetries);
-  if (ret != NO_ERROR) {
-    return;
-  }
-  LOG(VERBOSE) << "Loopback device created: " << loopback;
-
-  auto verityData = verifyApexVerity(*apex);
-  if (!verityData) {
-    return;
+  std::vector<std::string> ret;
+  struct dirent* dp;
+  while ((dp = readdir(d.get())) != NULL) {
+    if (dp->d_type != DT_DIR || (strcmp(dp->d_name, ".") == 0) ||
+        (strcmp(dp->d_name, "..") == 0)) {
+      continue;
+    }
+    ret.push_back(dp->d_name);
   }
 
-  auto verityTable = createVerityTable(*verityData, loopback);
-  std::string verityDevice = createVerityDevice(packageId, *verityTable);
-  if (verityDevice.empty()) {
-    return;
+  return StatusOr<std::vector<std::string>>(std::move(ret));
+}
+
+Status configureReadAhead(const std::string& device_path) {
+  auto pos = device_path.find("/dev/block/");
+  if (pos != 0) {
+    return Status::Fail(StringLog()
+                        << "Device path does not start with /dev/block.");
+  }
+  pos = device_path.find_last_of("/");
+  std::string device_name = device_path.substr(pos + 1, std::string::npos);
+
+  std::string sysfs_device =
+      StringPrintf("/sys/block/%s/queue/read_ahead_kb", device_name.c_str());
+  unique_fd sysfs_fd(open(sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
+  if (sysfs_fd.get() == -1) {
+    return Status::Fail(PStringLog() << "Failed to open " << sysfs_device);
+  }
+
+  int ret = TEMP_FAILURE_RETRY(
+      write(sysfs_fd.get(), kReadAheadKb, strlen(kReadAheadKb) + 1));
+  if (ret < 0) {
+    return Status::Fail(PStringLog() << "Failed to write to " << sysfs_device);
+  }
+
+  return Status::Success();
+}
+
+using ApexFileAndManifest =
+    std::pair<std::unique_ptr<ApexFile>, std::unique_ptr<ApexManifest>>;
+
+StatusOr<ApexFileAndManifest> openFileAndManifest(
+    const std::string& full_path) {
+  StatusOr<std::unique_ptr<ApexFile>> apexFileRes = ApexFile::Open(full_path);
+  if (!apexFileRes.Ok()) {
+    return StatusOr<ApexFileAndManifest>::MakeError(apexFileRes.ErrorMessage());
+  }
+
+  StatusOr<std::unique_ptr<ApexManifest>> manifestRes =
+      ApexManifest::Open((*apexFileRes)->GetManifest());
+  if (!manifestRes.Ok()) {
+    return StatusOr<ApexFileAndManifest>::MakeError(manifestRes.ErrorMessage());
+  }
+
+  return StatusOr<ApexFileAndManifest>(std::move(*apexFileRes),
+                                       std::move(*manifestRes));
+}
+
+Status activateNonFlattened(const ApexFile& apex,
+                            const ApexManifest& manifest) {
+  const std::string& full_path = apex.GetPath();
+  const std::string& packageId = manifest.GetPackageId();
+
+  LoopbackDeviceUniqueFd loopbackDevice;
+  for (size_t attempts = 1;; ++attempts) {
+    StatusOr<LoopbackDeviceUniqueFd> ret =
+        createLoopDevice(full_path, apex.GetImageOffset(), apex.GetImageSize());
+    if (ret.Ok()) {
+      loopbackDevice = std::move(*ret);
+      break;
+    }
+    if (attempts >= kLoopDeviceSetupAttempts) {
+      return Status::Fail(StringLog()
+                          << "Could not create loop device for " << full_path
+                          << ": " << ret.ErrorMessage());
+    }
+  }
+  LOG(VERBOSE) << "Loopback device created: " << loopbackDevice.name;
+
+  auto verityData = verifyApexVerity(apex);
+  if (!verityData.Ok()) {
+    return Status(StringLog()
+                  << "Failed to verify Apex Verity data for " << full_path
+                  << ": " << verityData.ErrorMessage());
+  }
+  std::string blockDevice = loopbackDevice.name;
+
+  // for APEXes in system partition, we don't need to mount them on dm-verity
+  // because they are already in the dm-verity protected partition; system.
+  // However, note that we don't skip verification to ensure that APEXes are
+  // correctly signed.
+  const bool mountOnVerity =
+      !android::base::StartsWith(full_path, kApexPackageSystemDir);
+  DmVerityDevice verityDev;
+  if (mountOnVerity) {
+    auto verityTable = createVerityTable(**verityData, loopbackDevice.name);
+    StatusOr<DmVerityDevice> verityDevRes =
+        createVerityDevice(packageId, *verityTable);
+    if (!verityDevRes.Ok()) {
+      return Status(StringLog()
+                    << "Failed to create Apex Verity device " << full_path
+                    << ": " << verityDevRes.ErrorMessage());
+    }
+    verityDev = std::move(*verityDevRes);
+    blockDevice = verityDev.GetDevPath();
+
+    Status readAheadStatus = configureReadAhead(verityDev.GetDevPath());
+    if (!readAheadStatus.Ok()) {
+      return readAheadStatus.ErrorMessage();
+    }
   }
 
   std::string mountPoint = StringPrintf("%s/%s", kApexRoot, packageId.c_str());
   LOG(VERBOSE) << "Creating mount point: " << mountPoint;
-  mkdir(mountPoint.c_str(), 0755);
+  mkdir(mountPoint.c_str(), kMkdirMode);
 
-  if (mount(verityDevice.c_str(), mountPoint.c_str(), "ext4",
-            MS_NOATIME | MS_NODEV | MS_NOSUID | MS_DIRSYNC | MS_RDONLY,
-            NULL) == 0) {
+  if (mount(blockDevice.c_str(), mountPoint.c_str(), "ext4",
+            MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, NULL) == 0) {
     LOG(INFO) << "Successfully mounted package " << full_path << " on "
               << mountPoint;
 
-    // TODO: only create symlinks if we are sure we are mounting the latest
+    // TODO: only create bind-mount if we are sure we are mounting the latest
     //       version of a package.
-    updateSymlink(manifest->GetName(), mountPoint);
-  } else {
-    PLOG(ERROR) << "Mounting failed for package " << full_path;
-    // Tear down loop device.
-    unique_fd fd(open(loopback.c_str(), O_RDWR | O_CLOEXEC));
-    if (fd.get() == -1) {
-      PLOG(WARNING) << "Failed to open " << loopback
-                    << " while attempting to clean up unused loop device";
-      return;
+    Status st = updateLatest(manifest.GetName(), mountPoint);
+    if (!st.Ok()) {
+      // TODO: Fail?
+      LOG(ERROR) << st.ErrorMessage();
     }
 
-    if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
-      PLOG(WARNING) << "Failed to clean up unused loop device " << loopback;
-      return;
+    // Time to accept the temporaries as good.
+    if (mountOnVerity) {
+      verityDev.Release();
     }
+    loopbackDevice.CloseGood();
+
+    return Status::Success();
+  }
+  return Status::Fail(PStringLog()
+                      << "Mounting failed for package " << full_path);
+}
+
+Status activateFlattened(const ApexFile& apex, const ApexManifest& manifest) {
+  if (!android::base::StartsWith(apex.GetPath(), kApexPackageSystemDir)) {
+    return Status::Fail(StringLog()
+                        << "Cannot activate flattened APEX " << apex.GetPath());
+  }
+
+  const std::string mountPoint =
+      StringPrintf("%s/%s", kApexRoot, manifest.GetPackageId().c_str());
+
+  LOG(VERBOSE) << "Creating mount point: " << mountPoint;
+  mkdir(mountPoint.c_str(), kMkdirMode);
+
+  if (mount(apex.GetPath().c_str(), mountPoint.c_str(), nullptr, MS_BIND,
+            nullptr) == 0) {
+    LOG(INFO) << "Successfully bind-mounted flattened package "
+              << apex.GetPath() << " on " << mountPoint;
+
+    // TODO: only create bind-mount if we are sure we are mounting the latest
+    //       version of a package.
+    Status st = updateLatest(manifest.GetName(), mountPoint);
+    if (!st.Ok()) {
+      // TODO: Fail?
+      LOG(ERROR) << st.ErrorMessage();
+    }
+
+    return Status::Success();
+  }
+  return Status::Fail(PStringLog() << "Mounting failed for flattened package "
+                                   << apex.GetPath());
+}
+
+}  // namespace
+
+Status activatePackage(const std::string& full_path) {
+  LOG(INFO) << "Trying to activate " << full_path;
+
+  StatusOr<std::unique_ptr<ApexFile>> apexFileRes = ApexFile::Open(full_path);
+  if (!apexFileRes.Ok()) {
+    return apexFileRes.ErrorStatus();
+  }
+  const std::unique_ptr<ApexFile>& apex = *apexFileRes;
+
+  StatusOr<std::unique_ptr<ApexManifest>> manifestRes =
+      ApexManifest::Open(apex->GetManifest());
+  if (!manifestRes.Ok()) {
+    return manifestRes.ErrorStatus();
+  }
+
+  if (apex->IsFlattened()) {
+    return activateFlattened(*apex, **manifestRes);
+  } else {
+    return activateNonFlattened(*apex, **manifestRes);
+  }
+}
+
+Status deactivatePackage(const std::string& full_path) {
+  LOG(INFO) << "Trying to deactivate " << full_path;
+
+  StatusOr<ApexFileAndManifest> apexFileAndManifest =
+      openFileAndManifest(full_path);
+  if (!apexFileAndManifest.Ok()) {
+    return apexFileAndManifest.ErrorStatus();
+  }
+  const std::unique_ptr<ApexFile>& apex = apexFileAndManifest->first;
+  const std::unique_ptr<ApexManifest>& manifest = apexFileAndManifest->second;
+
+  // TODO: It's not clear what the right thing to do is for umount failures.
+
+  // Unmount "latest" bind-mount.
+  // TODO: What if bind-mount isn't latest?
+  {
+    std::string mount_point =
+        StringPrintf("%s/%s", kApexRoot, manifest->GetName().c_str());
+    if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0) {
+      return Status::Fail(PStringLog() << "Failed to unmount " << mount_point);
+    }
+    if (rmdir(mount_point.c_str()) != 0) {
+      PLOG(ERROR) << "Could not rmdir " << mount_point;
+      // Continue here.
+    }
+  }
+
+  std::string packageId = manifest->GetPackageId();
+  std::string mount_point = StringPrintf("%s/%s", kApexRoot, packageId.c_str());
+  if (umount2(mount_point.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0) {
+    return Status::Fail(PStringLog() << "Failed to unmount " << mount_point);
+  }
+  std::string error_msg;
+  if (rmdir(mount_point.c_str()) != 0) {
+    // If we cannot delete the directory, we're in a bad state (e.g., getting
+    // active packages depends on directory existence right now).
+    // TODO: consider additional delayed cleanups, and rewrite once we have
+    //       a package database.
+    error_msg = PStringLog() << "Failed to rmdir " << mount_point;
+  }
+
+  // TODO: Find the loop device connected with the mount. For now, just run the
+  //       destroy-all and rely on EBUSY.
+  if (!apex->IsFlattened()) {
+    destroyAllLoopDevices();
+  }
+
+  if (error_msg.empty()) {
+    return Status::Success();
+  } else {
+    return Status::Fail(error_msg);
   }
 }
 
@@ -596,33 +923,37 @@ void unmountAndDetachExistingImages() {
   // becomes an actual daemon. Remove if that's the case.
   LOG(INFO) << "Scanning " << kApexRoot
             << " looking for packages already mounted.";
-  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(kApexRoot), closedir);
-  if (!d) {
-    // Nothing to do
-    PLOG(ERROR) << "Can't open " << kApexRoot;
+  StatusOr<std::vector<std::string>> folders_status = getApexRootSubFolders();
+  if (!folders_status.Ok()) {
+    LOG(ERROR) << folders_status.ErrorMessage();
     return;
   }
 
-  struct dirent* dp;
-  while ((dp = readdir(d.get())) != NULL) {
-    if (dp->d_type != DT_DIR || (strcmp(dp->d_name, ".") == 0) ||
-        (strcmp(dp->d_name, "..") == 0)) {
-      continue;
-    }
-    LOG(INFO) << "Unmounting " << kApexRoot << "/" << dp->d_name;
+  // Sort the folders. This way, the "latest" folder will appear before any
+  // versioned folder, so we'll unmount the bind-mount first.
+  std::vector<std::string>& folders = *folders_status;
+  std::sort(folders.begin(), folders.end());
+
+  for (const std::string& folder : folders) {
+    std::string full_path = std::string(kApexRoot).append("/").append(folder);
+    LOG(INFO) << "Unmounting " << full_path;
     // Lazily try to umount whatever is mounted.
-    if (umount2(StringPrintf("%s/%s", kApexRoot, dp->d_name).c_str(),
-                UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
+    if (umount2(full_path.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
         errno != EINVAL && errno != ENOENT) {
-      PLOG(ERROR) << "Failed to unmount directory " << kApexRoot << "/"
-                  << dp->d_name;
+      PLOG(ERROR) << "Failed to unmount directory " << full_path;
+    }
+    // Attempt to delete the folder. If the folder is retained, other
+    // data may be incorrect.
+    // TODO: Fix this.
+    if (rmdir(full_path.c_str()) != 0) {
+      PLOG(ERROR) << "Failed to rmdir directory " << full_path;
     }
   }
 
   destroyAllLoopDevices();
 }
 
-void scanPackagesDirAndMount(const char* apex_package_dir) {
+void scanPackagesDirAndActivate(const char* apex_package_dir) {
   LOG(INFO) << "Scanning " << apex_package_dir << " looking for APEX packages.";
   auto d =
       std::unique_ptr<DIR, int (*)(DIR*)>(opendir(apex_package_dir), closedir);
@@ -632,40 +963,68 @@ void scanPackagesDirAndMount(const char* apex_package_dir) {
                   << " not found, nothing to do.";
     return;
   }
+  const bool scanSystemApexes =
+      android::base::StartsWith(apex_package_dir, kApexPackageSystemDir);
   struct dirent* dp;
   while ((dp = readdir(d.get())) != NULL) {
-    if (dp->d_type != DT_REG || !EndsWith(dp->d_name, kApexPackageSuffix)) {
+    const std::string name(dp->d_name);
+    if (name == "." || name == "..") {
       continue;
     }
-    LOG(INFO) << "Found " << dp->d_name;
+    const bool isApexFile =
+        dp->d_type == DT_REG && EndsWith(name, kApexPackageSuffix);
+    if (isApexFile || (dp->d_type == DT_DIR && scanSystemApexes)) {
+      LOG(INFO) << "Found " << name;
 
-    installPackage(StringPrintf("%s/%s", apex_package_dir, dp->d_name));
+      Status res = activatePackage(std::string(apex_package_dir) + "/" + name);
+      if (!res.Ok()) {
+        LOG(ERROR) << res.ErrorMessage();
+      }
+    }
   }
 }
+
+Status stagePackage(const std::string& packageTmpPath) {
+  LOG(DEBUG) << "stagePackage() for " << packageTmpPath;
+
+  StatusOr<ApexFileAndManifest> apexFileAndManifest =
+      openFileAndManifest(packageTmpPath);
+  if (!apexFileAndManifest.Ok()) {
+    return apexFileAndManifest.ErrorStatus();
+  }
+  const std::unique_ptr<ApexManifest>& manifest = apexFileAndManifest->second;
+  std::string packageId =
+      manifest->GetName() + "@" + std::to_string(manifest->GetVersion());
+
+  std::string destPath = StringPrintf("%s/%s%s", kApexPackageDataDir,
+                                      packageId.c_str(), kApexPackageSuffix);
+  if (rename(packageTmpPath.c_str(), destPath.c_str()) != 0) {
+    // TODO: Get correct binder error status.
+    return Status::Fail(PStringLog() << "Unable to rename " << packageTmpPath
+                                     << " to " << destPath);
+  }
+  LOG(DEBUG) << "Success renaming " << packageTmpPath << " to " << destPath;
+  return Status::Success();
+}
+
+void onStart() {
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusStarting;
+  }
+}
+
+void onAllPackagesReady() {
+  // Set a system property to let other components to know that APEXs are
+  // correctly mounted and ready to be used. Before using any file from APEXs,
+  // they can query this system property to ensure that they are okay to
+  // access. Or they may have a on-property trigger to delay a task until
+  // APEXs become ready.
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusReady)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusReady;
+  }
+}
+
 }  // namespace apex
 }  // namespace android
-
-int main(int /*argc*/, char** /*argv*/) {
-  sp<ProcessState> ps(ProcessState::self());
-
-  // TODO: add a -v flag or an external setting to change LogSeverity.
-  android::base::SetMinimumLogSeverity(android::base::VERBOSE);
-
-  // Create binder service and register with servicemanager
-  sp<ApexService> apexService = new ApexService();
-  defaultServiceManager()->addService(String16(android::apex::kApexServiceName),
-                                      apexService);
-
-  android::apex::unmountAndDetachExistingImages();
-  // Scan the directory under /data first, as it may contain updates of APEX
-  // packages living in the directory under /system, and we want the former ones
-  // to be used over the latter ones.
-  android::apex::scanPackagesDirAndMount(android::apex::kApexPackageDataDir);
-  android::apex::scanPackagesDirAndMount(android::apex::kApexPackageSystemDir);
-
-  // Start threadpool, wait for IPC
-  ps->startThreadPool();
-  IPCThreadState::self()->joinThreadPool();  // should not return
-
-  return 1;
-}
