@@ -45,7 +45,6 @@ Aborting.
 
 tool_path = os.environ['APEXER_TOOL_PATH']
 tool_path_list = tool_path.split(":")
-print "Using tool_path_list=" + str(tool_path_list)
 
 def ParseArgs(argv):
   parser = argparse.ArgumentParser(description='Create an APEX file')
@@ -53,7 +52,7 @@ def ParseArgs(argv):
                       help='force overwriting output')
   parser.add_argument('-v', '--verbose', action='store_true',
                       help='verbose execution')
-  parser.add_argument('--manifest', default='manifest.json',
+  parser.add_argument('--manifest', default='apex_manifest.json',
                       help='path to the APEX manifest file')
   parser.add_argument('--file_contexts', required=True,
                       help='selinux file contexts file')
@@ -86,7 +85,7 @@ def RunCommand(cmd, verbose=False, env=None):
       cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
   output, _ = p.communicate()
 
-  if verbose:
+  if verbose or p.returncode is not 0:
     print(output.rstrip())
 
   assert p.returncode is 0, "Failed to execute: " + " ".join(cmd)
@@ -111,7 +110,7 @@ def PrepareAndroidManifest(package, version):
   template = """\
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-  package="{package}" versionCode="{version}">
+  package="{package}" android:versionCode="{version}">
   <!-- APEX does not have classes.dex -->
   <application android:hasCode="false" />
 </manifest>
@@ -147,6 +146,9 @@ def CreateApex(args, work_dir):
   if not ValidateArgs(args):
     return False
 
+  if args.verbose:
+    print "Using tools from " + str(tool_path_list)
+
   try:
     with open(args.manifest) as f:
       manifest = json.load(f)
@@ -160,8 +162,14 @@ def CreateApex(args, work_dir):
   if 'name' not in manifest or manifest['name'] is None:
     print("Invalid manifest: 'name' does not exist")
     return False
+
   package_name = manifest['name']
   version_number = manifest['version']
+  key_name = os.path.basename(os.path.splitext(args.key)[0])
+
+  if package_name != key_name:
+    print("package name '" + package_name + "' does not match with key name '" + key_name + "'")
+    return False
 
   # create an empty ext4 image that is sufficiently big
   # Sufficiently big = twice the size of the input directory
@@ -172,7 +180,7 @@ def CreateApex(args, work_dir):
 
   content_dir = os.path.join(work_dir, 'content')
   os.mkdir(content_dir)
-  img_file = os.path.join(content_dir, 'image.img')
+  img_file = os.path.join(content_dir, 'apex_payload.img')
 
   cmd = ['mke2fs']
   cmd.extend(['-O', '^has_journal']) # because image is read-only
@@ -205,7 +213,7 @@ def CreateApex(args, work_dir):
   # within the zip container).
   manifests_dir = os.path.join(work_dir, 'manifests')
   os.mkdir(manifests_dir)
-  manifest_file = os.path.join(manifests_dir, 'manifest.json')
+  manifest_file = os.path.join(manifests_dir, 'apex_manifest.json')
   if args.verbose:
     print('Copying ' + args.manifest + ' to ' + manifest_file)
   shutil.copyfile(args.manifest, manifest_file)
@@ -230,7 +238,7 @@ def CreateApex(args, work_dir):
   cmd.append('--do_not_generate_fec')
   cmd.extend(['--algorithm', 'SHA256_RSA4096'])
   cmd.extend(['--key', args.key])
-  cmd.extend(['--prop', "apex.key:" + os.path.basename(os.path.splitext(args.key)[0])])
+  cmd.extend(['--prop', "apex.key:" + key_name])
   cmd.extend(['--image', img_file])
   RunCommand(cmd, args.verbose)
 
@@ -259,7 +267,7 @@ def CreateApex(args, work_dir):
 
   # copy manifest to the content dir so that it is also accessible
   # without mounting the image
-  shutil.copyfile(args.manifest, os.path.join(content_dir, 'manifest.json'))
+  shutil.copyfile(args.manifest, os.path.join(content_dir, 'apex_manifest.json'))
 
   apk_file = os.path.join(work_dir, 'apex.apk')
   cmd = ['aapt2']
