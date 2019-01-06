@@ -57,8 +57,7 @@ class ApexService : public BnApexService {
                             bool* aidl_return) override;
   BinderStatus activatePackage(const std::string& packagePath) override;
   BinderStatus deactivatePackage(const std::string& packagePath) override;
-  BinderStatus getActivePackages(
-      std::vector<ApexPackageInfo>* aidl_return) override;
+  BinderStatus getActivePackages(std::vector<ApexInfo>* aidl_return) override;
 
   // Override onTransact so we can handle shellCommand.
   status_t onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
@@ -141,37 +140,15 @@ BinderStatus ApexService::deactivatePackage(const std::string& packagePath) {
 }
 
 BinderStatus ApexService::getActivePackages(
-    std::vector<ApexPackageInfo>* aidl_return) {
-  LOG(DEBUG) << "Scanning " << kApexRoot << " looking for active packages.";
-  // This code would be much shorter if C++17's std::filesystem were available,
-  // which is not at the time of writing this.
-  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(kApexRoot), closedir);
-  if (!d) {
-    PLOG(ERROR) << "Can't open " << kApexRoot << " for reading.";
-    return BinderStatus::fromExceptionCode(
-        BinderStatus::EX_ILLEGAL_STATE,
-        "Internal error, apex root directory is not readable or doesn't "
-        "exist.");
-  }
-
-  struct dirent* dp;
-  while ((dp = readdir(d.get())) != NULL) {
-    if (dp->d_type != DT_DIR || (strcmp(dp->d_name, ".") == 0) ||
-        (strcmp(dp->d_name, "..") == 0)) {
-      continue;
-    }
-    ApexPackageInfo pkg;
-    std::vector<std::string> splits = android::base::Split(dp->d_name, "@");
-    if (splits.size() != 2) {
-      LOG(ERROR) << "Unable to extract package info from directory name "
-                 << dp->d_name << "... skipping.";
-      continue;
-    }
-
-    pkg.package_name = splits[0];
-    pkg.version_code = atol(splits[1].c_str());
+    std::vector<ApexInfo>* aidl_return) {
+  auto data = ::android::apex::getActivePackages();
+  for (const auto& pair : data) {
+    ApexInfo pkg;
+    pkg.packageName = pair.first;
+    pkg.versionCode = pair.second;
     aidl_return->push_back(pkg);
   }
+
   return BinderStatus::ok();
 }
 
@@ -240,13 +217,13 @@ status_t ApexService::shellCommand(int in, int out, int err,
     return BAD_VALUE;
   }
   if (args.size() == 1 && args[0] == String16("getActivePackages")) {
-    std::vector<ApexPackageInfo> list;
+    std::vector<ApexInfo> list;
     android::binder::Status status = getActivePackages(&list);
     if (status.isOk()) {
       auto out_str = std::fstream(base::StringPrintf("/proc/self/fd/%d", out));
       for (auto item : list) {
-        out_str << "Package: " << item.package_name
-                << " Version: " << item.version_code << std::endl;
+        out_str << "Package: " << item.packageName
+                << " Version: " << item.versionCode << std::endl;
       }
       return OK;
     }
