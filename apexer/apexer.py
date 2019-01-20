@@ -23,13 +23,16 @@ Typical usage: apexer input_dir output.apex
 """
 
 import argparse
-import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from apex_manifest import ValidateApexManifest
+from apex_manifest import ApexManifestError
 
 if 'APEXER_TOOL_PATH' not in os.environ:
   sys.stderr.write("""
@@ -54,16 +57,22 @@ def ParseArgs(argv):
                       help='verbose execution')
   parser.add_argument('--manifest', default='apex_manifest.json',
                       help='path to the APEX manifest file')
-  parser.add_argument('--file_contexts', required=True,
-                      help='selinux file contexts file')
-  parser.add_argument('--canned_fs_config', required=True,
-                      help='canned_fs_config specifies uid/gid/mode of files')
-  parser.add_argument('--key', required=True,
-                      help='path to the private key file')
+  parser.add_argument('--file_contexts',
+                      help='selinux file contexts file. Required for "image" APEXs.')
+  parser.add_argument('--canned_fs_config',
+                      help='canned_fs_config specifies uid/gid/mode of files. Required for ' +
+                           '"image" APEXS.')
+  parser.add_argument('--key',
+                      help='path to the private key file. Required for "image" APEXs.')
+  parser.add_argument('--pubkey',
+                      help='path to the public key file. Used to bundle the public key in APEX for testing.')
   parser.add_argument('input_dir', metavar='INPUT_DIR',
                       help='the directory having files to be packaged')
   parser.add_argument('output', metavar='OUTPUT',
                       help='name of the APEX file')
+  parser.add_argument('--payload_type', metavar='TYPE', required=False, default="image",
+                      choices=["zip", "image"],
+                      help='type of APEX payload being built "zip" or "image"')
   return parser.parse_args(argv)
 
 def FindBinaryPath(binary):
@@ -139,8 +148,20 @@ def ValidateArgs(args):
     print(args.output + ' already exists. Use --force to overwrite.')
     return False
 
-  return True
+  if args.payload_type == "image":
+    if not args.key:
+      print("Missing --key {keyfile} argument!")
+      return False
 
+    if not args.file_contexts:
+      print("Missing --file_contexts {contexts} argument!")
+      return False
+
+    if not args.canned_fs_config:
+      print("Missing --canned_fs_config {config} argument!")
+      return False
+
+  return True
 
 def CreateApex(args, work_dir):
   if not ValidateArgs(args):
@@ -150,25 +171,15 @@ def CreateApex(args, work_dir):
     print "Using tools from " + str(tool_path_list)
 
   try:
-    with open(args.manifest) as f:
-      manifest = json.load(f)
-  except ValueError:
+    with open(args.manifest, "r") as f:
+      manifest_raw = f.read()
+      manifest_apex = ValidateApexManifest(manifest_raw)
+  except ApexManifestError as err:
     print("'" + args.manifest + "' is not a valid manifest file")
+    print err.errmessage
     return False
   except IOError:
     print("Cannot read manifest file: '" + args.manifest + "'")
-    return False
-
-  if 'name' not in manifest or manifest['name'] is None:
-    print("Invalid manifest: 'name' does not exist")
-    return False
-
-  package_name = manifest['name']
-  version_number = manifest['version']
-  key_name = os.path.basename(os.path.splitext(args.key)[0])
-
-  if package_name != key_name:
-    print("package name '" + package_name + "' does not match with key name '" + key_name + "'")
     return False
 
   # create an empty ext4 image that is sufficiently big
@@ -180,33 +191,6 @@ def CreateApex(args, work_dir):
 
   content_dir = os.path.join(work_dir, 'content')
   os.mkdir(content_dir)
-  img_file = os.path.join(content_dir, 'apex_payload.img')
-
-  cmd = ['mke2fs']
-  cmd.extend(['-O', '^has_journal']) # because image is read-only
-  cmd.extend(['-b', '4096']) # block size
-  cmd.extend(['-m', '0']) # reserved block percentage
-  cmd.extend(['-t', 'ext4'])
-  cmd.append(img_file)
-  cmd.append(str(size_in_mb) + 'M')
-  RunCommand(cmd, args.verbose)
-
-  # Compile the file context into the binary form
-  compiled_file_contexts = os.path.join(work_dir, 'file_contexts.bin')
-  cmd = ['sefcontext_compile']
-  cmd.extend(['-o', compiled_file_contexts])
-  cmd.append(args.file_contexts)
-  RunCommand(cmd, args.verbose)
-
-  # Add files to the image file
-  cmd = ['e2fsdroid']
-  cmd.append('-e') # input is not android_sparse_file
-  cmd.extend(['-f', args.input_dir])
-  cmd.extend(['-T', '0']) # time is set to epoch
-  cmd.extend(['-S', compiled_file_contexts])
-  cmd.extend(['-C', args.canned_fs_config])
-  cmd.append(img_file)
-  RunCommand(cmd, args.verbose)
 
   # APEX manifest is also included in the image. The manifest is included
   # twice: once inside the image and once outside the image (but still
@@ -218,44 +202,95 @@ def CreateApex(args, work_dir):
     print('Copying ' + args.manifest + ' to ' + manifest_file)
   shutil.copyfile(args.manifest, manifest_file)
 
-  cmd = ['e2fsdroid']
-  cmd.append('-e') # input is not android_sparse_file
-  cmd.extend(['-f', manifests_dir])
-  cmd.extend(['-T', '0']) # time is set to epoch
-  cmd.extend(['-S', compiled_file_contexts])
-  cmd.extend(['-C', args.canned_fs_config])
-  cmd.append(img_file)
-  RunCommand(cmd, args.verbose)
+  if args.payload_type == 'image':
+    key_name = os.path.basename(os.path.splitext(args.key)[0])
 
-  # Resize the image file to save space
-  cmd = ['resize2fs']
-  cmd.append('-M') # shrink as small as possible
-  cmd.append(img_file)
-  RunCommand(cmd, args.verbose)
+    if manifest_apex.name != key_name:
+      print("package name '" + manifest_apex.name + "' does not match with key name '" + key_name + "'")
+      return False
+    img_file = os.path.join(content_dir, 'apex_payload.img')
 
-  cmd = ['avbtool']
-  cmd.append('add_hashtree_footer')
-  cmd.append('--do_not_generate_fec')
-  cmd.extend(['--algorithm', 'SHA256_RSA4096'])
-  cmd.extend(['--key', args.key])
-  cmd.extend(['--prop', "apex.key:" + key_name])
-  cmd.extend(['--image', img_file])
-  RunCommand(cmd, args.verbose)
+    cmd = ['mke2fs']
+    cmd.extend(['-O', '^has_journal']) # because image is read-only
+    cmd.extend(['-b', '4096']) # block size
+    cmd.extend(['-m', '0']) # reserved block percentage
+    cmd.extend(['-t', 'ext4'])
+    uu = str(uuid.uuid5(uuid.NAMESPACE_URL, "www.android.com"))
+    cmd.extend(['-U', uu])
+    cmd.extend(['-E', 'hash_seed=' + uu])
+    cmd.append(img_file)
+    cmd.append(str(size_in_mb) + 'M')
+    RunCommand(cmd, args.verbose, {"E2FSPROGS_FAKE_TIME": "1"})
 
-  # Get the minimum size of the partition required.
-  # TODO(b/113320014) eliminate this step
-  info, _ = RunCommand(['avbtool', 'info_image', '--image', img_file], args.verbose)
-  vbmeta_offset = int(re.search('VBMeta\ offset:\ *([0-9]+)', info).group(1))
-  vbmeta_size = int(re.search('VBMeta\ size:\ *([0-9]+)', info).group(1))
-  partition_size = RoundUp(vbmeta_offset + vbmeta_size, 4096) + 4096
+    # Compile the file context into the binary form
+    compiled_file_contexts = os.path.join(work_dir, 'file_contexts.bin')
+    cmd = ['sefcontext_compile']
+    cmd.extend(['-o', compiled_file_contexts])
+    cmd.append(args.file_contexts)
+    RunCommand(cmd, args.verbose)
 
-  # Resize to the minimum size
-  # TODO(b/113320014) eliminate this step
-  cmd = ['avbtool']
-  cmd.append('resize_image')
-  cmd.extend(['--image', img_file])
-  cmd.extend(['--partition_size', str(partition_size)])
-  RunCommand(cmd, args.verbose)
+    # Add files to the image file
+    cmd = ['e2fsdroid']
+    cmd.append('-e') # input is not android_sparse_file
+    cmd.extend(['-f', args.input_dir])
+    cmd.extend(['-T', '0']) # time is set to epoch
+    cmd.extend(['-S', compiled_file_contexts])
+    cmd.extend(['-C', args.canned_fs_config])
+    cmd.append(img_file)
+    RunCommand(cmd, args.verbose)
+
+    cmd = ['e2fsdroid']
+    cmd.append('-e') # input is not android_sparse_file
+    cmd.extend(['-f', manifests_dir])
+    cmd.extend(['-T', '0']) # time is set to epoch
+    cmd.extend(['-S', compiled_file_contexts])
+    cmd.extend(['-C', args.canned_fs_config])
+    cmd.append(img_file)
+    RunCommand(cmd, args.verbose, {"E2FSPROGS_FAKE_TIME": "1"})
+
+    # Resize the image file to save space
+    cmd = ['resize2fs']
+    cmd.append('-M') # shrink as small as possible
+    cmd.append(img_file)
+    RunCommand(cmd, args.verbose, {"E2FSPROGS_FAKE_TIME": "1"})
+
+
+    cmd = ['avbtool']
+    cmd.append('add_hashtree_footer')
+    cmd.append('--do_not_generate_fec')
+    cmd.extend(['--algorithm', 'SHA256_RSA4096'])
+    cmd.extend(['--key', args.key])
+    cmd.extend(['--prop', "apex.key:" + key_name])
+    # Set up the salt based on manifest content which includes name
+    # and version
+    salt = hashlib.sha256(manifest_raw).hexdigest()
+    cmd.extend(['--salt', salt])
+    cmd.extend(['--image', img_file])
+    RunCommand(cmd, args.verbose)
+
+    # Get the minimum size of the partition required.
+    # TODO(b/113320014) eliminate this step
+    info, _ = RunCommand(['avbtool', 'info_image', '--image', img_file], args.verbose)
+    vbmeta_offset = int(re.search('VBMeta\ offset:\ *([0-9]+)', info).group(1))
+    vbmeta_size = int(re.search('VBMeta\ size:\ *([0-9]+)', info).group(1))
+    partition_size = RoundUp(vbmeta_offset + vbmeta_size, 4096) + 4096
+
+    # Resize to the minimum size
+    # TODO(b/113320014) eliminate this step
+    cmd = ['avbtool']
+    cmd.append('resize_image')
+    cmd.extend(['--image', img_file])
+    cmd.extend(['--partition_size', str(partition_size)])
+    RunCommand(cmd, args.verbose)
+  else:
+    img_file = os.path.join(content_dir, 'apex_payload.zip')
+    cmd = ['soong_zip']
+    cmd.extend(['-o', img_file])
+    cmd.extend(['-C', args.input_dir])
+    cmd.extend(['-D', args.input_dir])
+    cmd.extend(['-C', manifests_dir])
+    cmd.extend(['-D', manifests_dir])
+    RunCommand(cmd, args.verbose)
 
   # package the image file and APEX manifest as an APK.
   # The AndroidManifest file is automatically generated.
@@ -263,11 +298,15 @@ def CreateApex(args, work_dir):
   if args.verbose:
     print('Creating AndroidManifest ' + android_manifest_file)
   with open(android_manifest_file, 'w+') as f:
-    f.write(PrepareAndroidManifest(package_name, version_number))
+    f.write(PrepareAndroidManifest(manifest_apex.name, manifest_apex.version))
 
   # copy manifest to the content dir so that it is also accessible
   # without mounting the image
   shutil.copyfile(args.manifest, os.path.join(content_dir, 'apex_manifest.json'))
+
+  # copy the public key, if specified
+  if args.pubkey:
+    shutil.copyfile(args.pubkey, os.path.join(content_dir, "apex_pubkey"))
 
   apk_file = os.path.join(work_dir, 'apex.apk')
   cmd = ['aapt2']

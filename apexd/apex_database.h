@@ -88,6 +88,29 @@ class MountedApexDatabase {
     }
   }
 
+  inline void SetLatest(const std::string& package,
+                        const std::string& full_path) {
+    auto it = mounted_apexes_.find(package);
+    CHECK(it != mounted_apexes_.end());
+
+    auto& pkg_map = it->second;
+
+    for (auto pkg_it = pkg_map.begin(); pkg_it != pkg_map.end(); ++pkg_it) {
+      if (pkg_it->first.full_path == full_path) {
+        pkg_it->second = true;
+        for (auto reset_it = pkg_map.begin(); reset_it != pkg_map.end();
+             ++reset_it) {
+          if (reset_it != pkg_it) {
+            reset_it->second = false;
+          }
+        }
+        return;
+      }
+    }
+
+    LOG(FATAL) << "Did not find " << package << " " << full_path;
+  }
+
   inline void UnsetLatestForall(const std::string& package) {
     auto it = mounted_apexes_.find(package);
     if (it == mounted_apexes_.end()) {
