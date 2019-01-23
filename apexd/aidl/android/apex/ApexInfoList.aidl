@@ -16,8 +16,8 @@
 
 package android.apex;
 
-parcelable ApexInfo {
-    @utf8InCpp String packageName;
-    @utf8InCpp String packagePath;
-    long versionCode;
+import android.apex.ApexInfo;
+
+parcelable ApexInfoList {
+    ApexInfo[] apexInfos;
 }

@@ -85,7 +85,7 @@ StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
     image_offset = 0;
     image_size = 0;
     const std::string manifest_path = path + "/" + kManifestFilename;
-    if (!android::base::ReadFileToString(path, &manifest_content)) {
+    if (!android::base::ReadFileToString(manifest_path, &manifest_content)) {
       std::string err = StringLog()
                         << "Failed to read manifest file: " << manifest_path;
       return StatusOr<ApexFile>::MakeError(err);
@@ -153,7 +153,7 @@ StatusOr<ApexFile> ApexFile::Open(const std::string& path) {
     }
   }
 
-  StatusOr<ApexManifest> manifest = ApexManifest::Parse(manifest_content);
+  StatusOr<ApexManifest> manifest = ParseManifest(manifest_content);
   if (!manifest.Ok()) {
     return StatusOr<ApexFile>::MakeError(manifest.ErrorMessage());
   }
@@ -206,13 +206,13 @@ StatusOr<std::unique_ptr<AvbFooter>> getAvbFooter(const ApexFile& apex,
   int ret = lseek(fd, offset, SEEK_SET);
   if (ret == -1) {
     return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
-        PStringLog() << "Couldn't seek to AVB footer.");
+        PStringLog() << "Couldn't seek to AVB footer");
   }
 
   ret = read(fd, footer_data.data(), AVB_FOOTER_SIZE);
   if (ret != AVB_FOOTER_SIZE) {
     return StatusOr<std::unique_ptr<AvbFooter>>::MakeError(
-        PStringLog() << "Couldn't read AVB footer.");
+        PStringLog() << "Couldn't read AVB footer");
   }
 
   if (!avb_footer_validate_and_byteswap((const AvbFooter*)footer_data.data(),
@@ -286,10 +286,10 @@ StatusOr<std::string> getPublicKeyFilePath(const ApexFile& apex,
                     << apex.GetPath());
   }
 
-  if (keyName != apex.GetManifest().GetName()) {
+  if (keyName != apex.GetManifest().name()) {
     return StatusOr<std::string>::MakeError(
         StringLog() << "Key mismatch: apex name is '"
-                    << apex.GetManifest().GetName() << "'"
+                    << apex.GetManifest().name() << "'"
                     << " but key name is '" << keyName << "'");
   }
 
@@ -386,7 +386,7 @@ StatusOr<std::unique_ptr<uint8_t[]>> verifyVbMeta(
 
   if (!ReadFullyAtOffset(fd, vbmeta_buf.get(), footer.vbmeta_size, offset)) {
     return StatusOr<std::unique_ptr<uint8_t[]>>::MakeError(
-        PStringLog() << "Couldn't read AVB meta-data.");
+        PStringLog() << "Couldn't read AVB meta-data");
   }
 
   Status st = verifyVbMetaSignature(apex, vbmeta_buf.get(), footer.vbmeta_size,

@@ -3,6 +3,8 @@ cc_defaults {
   cflags: [
     "-Wall",
     "-Wextra",
+    "-Werror",
+    "-Wno-unused-parameter",
 
     // Some extra flags.
     "-fstrict-aliasing",
@@ -20,7 +22,14 @@ cc_defaults {
   shared_libs: [
     "libbase",
     "libjsoncpp",
+    "libprotobuf-cpp-full",
     "libziparchive",
+    // Required full for parsing json string to message
+    "libprotobuf-cpp-full",
+  ],
+  static_libs: [
+    "lib_apex_session_state_proto",
+    "lib_apex_manifest_proto"
   ],
 }
 
@@ -28,6 +37,8 @@ aidl_interface {
   name: "apex_aidl_interface",
   srcs: [
     "aidl/android/apex/ApexInfo.aidl",
+    "aidl/android/apex/ApexInfoList.aidl",
+    "aidl/android/apex/ApexSessionInfo.aidl",
     "aidl/android/apex/IApexService.aidl",
   ],
   local_include_dir: "aidl",
@@ -65,8 +76,10 @@ cc_library_static {
   defaults: ["apex_defaults"],
   srcs: [
     "apexd.cpp",
-    "apexd_preinstall.cpp",
+    "apexd_loop.cpp",
+    "apexd_prepostinstall.cpp",
     "apexd_private.cpp",
+    "apexd_session.cpp"
   ],
   static_libs: [
     "libapex",
@@ -173,12 +186,15 @@ cc_test {
   defaults: ["apex_defaults"],
   data: [
     ":apex.apexd_test",
+    ":apex.apexd_test_different_app",
     ":apex.apexd_test_v2",
     ":apex.apexd_test_no_inst_key",
     ":apex.apexd_test_preinstall",
+    ":apex.apexd_test_postinstall",
   ],
   srcs: ["apexservice_test.cpp"],
   host_supported: false,
+  compile_multilib: "first",
   static_libs: [
     "apex_aidl_interface-cpp",
     "libapex",

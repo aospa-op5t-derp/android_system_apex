@@ -14,6 +14,16 @@
  * limitations under the License.
  */
 
+cc_library_static {
+    name: "lib_apex_manifest_proto",
+    host_supported: true,
+    proto: {
+        export_proto_headers: true,
+        type: "full",
+    },
+    srcs: ["apex_manifest.proto"],
+}
+
 python_library_host {
     name: "apex_manifest_proto",
     version: {
@@ -30,4 +40,14 @@ python_library_host {
     proto: {
         canonical_path_from_root: false,
     },
+}
+
+cc_library_static {
+    name: "lib_apex_session_state_proto",
+    host_supported: true,
+    proto: {
+        export_proto_headers: true,
+        type: "full",
+    },
+    srcs: ["session_state.proto"],
 }
