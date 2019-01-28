@@ -18,6 +18,7 @@
 #define ANDROID_APEXD_APEXD_H_
 
 #include <string>
+#include <vector>
 
 #include <android-base/macros.h>
 
@@ -34,10 +35,15 @@ void unmountAndDetachExistingImages();
 
 void scanPackagesDirAndActivate(const char* apex_package_dir);
 
-Status stagePackage(const std::string& packageTmpPath) WARN_UNUSED;
+Status verifyPackages(const std::vector<std::string>& paths) WARN_UNUSED;
+Status preinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;
+
+Status stagePackages(const std::vector<std::string>& tmp_paths) WARN_UNUSED;
 
 Status activatePackage(const std::string& full_path) WARN_UNUSED;
 Status deactivatePackage(const std::string& full_path) WARN_UNUSED;
+
+std::vector<std::pair<std::string, uint64_t>> getActivePackages();
 
 void onStart();
 void onAllPackagesReady();

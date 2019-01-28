@@ -13,46 +13,108 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include <string>
+
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/scopeguard.h>
 #include <gtest/gtest.h>
-#include <string>
+#include <libavb/libavb.h>
+#include <ziparchive/zip_archive.h>
 
 #include "apex_file.h"
 
-static std::string testDataDir =
-    android::base::GetExecutableDirectory() + "/apexd_testdata";
+static std::string testDataDir = android::base::GetExecutableDirectory() + "/";
 
 namespace android {
 namespace apex {
+namespace {
 
 TEST(ApexFileTest, GetOffsetOfSimplePackage) {
-  const std::string filePath = testDataDir + "/test.apex";
-  StatusOr<std::unique_ptr<ApexFile>> apexFileRes = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFileRes.Ok());
-  ApexFile* apexFile = apexFileRes->get();
-  EXPECT_EQ(4096, apexFile->GetImageOffset());
-  EXPECT_EQ(589824u, apexFile->GetImageSize());
+  const std::string filePath = testDataDir + "apex.apexd_test.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok());
+
+  int32_t zip_image_offset;
+  size_t zip_image_size;
+  {
+    ZipArchiveHandle handle;
+    int32_t rc = OpenArchive(filePath.c_str(), &handle);
+    ASSERT_EQ(0, rc);
+    auto close_guard =
+        android::base::make_scope_guard([&handle]() { CloseArchive(handle); });
+
+    ZipEntry entry;
+    rc = FindEntry(handle, ZipString("apex_payload.img"), &entry);
+    ASSERT_EQ(0, rc);
+
+    zip_image_offset = entry.offset;
+    EXPECT_EQ(zip_image_offset % 4096, 0);
+    zip_image_size = entry.uncompressed_length;
+    EXPECT_EQ(zip_image_size, entry.compressed_length);
+  }
+
+  EXPECT_EQ(zip_image_offset, apexFile->GetImageOffset());
+  EXPECT_EQ(zip_image_size, apexFile->GetImageSize());
 }
 
 TEST(ApexFileTest, GetOffsetMissingFile) {
-  const std::string filePath = testDataDir + "/missing.apex";
-  StatusOr<std::unique_ptr<ApexFile>> apexFileRes = ApexFile::Open(filePath);
-  ASSERT_FALSE(apexFileRes.Ok());
+  const std::string filePath = testDataDir + "missing.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_FALSE(apexFile.Ok());
   EXPECT_NE(std::string::npos,
-            apexFileRes.ErrorMessage().find("Failed to open package"))
-      << apexFileRes.ErrorMessage();
+            apexFile.ErrorMessage().find("Failed to open package"))
+      << apexFile.ErrorMessage();
 }
 
 TEST(ApexFileTest, GetApexManifest) {
-  const std::string filePath = testDataDir + "/test.apex";
-  StatusOr<std::unique_ptr<ApexFile>> apexFileRes = ApexFile::Open(filePath);
-  ASSERT_TRUE(apexFileRes.Ok());
-  ApexFile* apexFile = apexFileRes->get();
-  EXPECT_EQ(
-      "{\n  \"name\": \"com.android.example.apex\",\n  \"version\": 1\n}\n",
-      std::string(apexFile->GetManifest()));
+  const std::string filePath = testDataDir + "apex.apexd_test.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok());
+  EXPECT_EQ("com.android.apex.test_package", apexFile->GetManifest().GetName());
+  EXPECT_EQ(1UL, apexFile->GetManifest().GetVersion());
 }
+
+TEST(ApexFileTest, VerifyApexVerity) {
+  const std::string filePath = testDataDir + "apex.apexd_test.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
+
+  auto verity_or = apexFile->VerifyApexVerity({ "/system/etc/security/apex/" });
+  ASSERT_TRUE(verity_or.Ok()) << verity_or.ErrorMessage();
+
+  const ApexVerityData& data = *verity_or;
+  EXPECT_NE(nullptr, data.desc.get());
+  EXPECT_EQ(std::string("1772301d454698dd155205b7851959c625d8a3e6"
+                        "d39360122693bad804b70007"),
+            data.salt);
+  EXPECT_EQ(std::string("661751839ac6924b2670f102f41bc5a9b239a0a2"),
+            data.root_digest);
+}
+
+// TODO: May consider packaging a debug key in debug builds (again).
+#if 0
+TEST(ApexFileTest, VerifyApexVerityNoKeyDir) {
+  const std::string filePath = testDataDir + "apex.apexd_test.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
+
+  auto verity_or = apexFile->VerifyApexVerity({"/tmp/"});
+  ASSERT_FALSE(verity_or.Ok());
+}
+#endif
+
+TEST(ApexFileTest, VerifyApexVerityNoKeyInst) {
+  const std::string filePath = testDataDir + "apex.apexd_test_no_inst_key.apex";
+  StatusOr<ApexFile> apexFile = ApexFile::Open(filePath);
+  ASSERT_TRUE(apexFile.Ok()) << apexFile.ErrorMessage();
+
+  auto verity_or = apexFile->VerifyApexVerity({"/system/etc/security/apex/"});
+  ASSERT_FALSE(verity_or.Ok());
+}
+
+}  // namespace
 }  // namespace apex
 }  // namespace android
 

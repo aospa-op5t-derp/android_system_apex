@@ -14,62 +14,83 @@
  * limitations under the License.
  */
 
-#include <android-base/logging.h>
-#include <memory>
-#include <string>
-
-#include <json/reader.h>
-#include <json/value.h>
-
 #include "apex_manifest.h"
 #include "string_log.h"
+
+#include <android-base/logging.h>
+#include <json/reader.h>
+#include <json/value.h>
+#include <memory>
+#include <string>
 
 namespace android {
 namespace apex {
 
-StatusOr<std::unique_ptr<ApexManifest>> ApexManifest::Open(
-    const std::string& apex_manifest) {
-  std::unique_ptr<ApexManifest> ret(new ApexManifest(apex_manifest));
-  std::string error_msg;
-  if (ret->OpenInternal(&error_msg) < 0) {
-    return StatusOr<std::unique_ptr<ApexManifest>>::MakeError(error_msg);
-  }
-  return StatusOr<std::unique_ptr<ApexManifest>>(std::move(ret));
-}
+StatusOr<ApexManifest> ApexManifest::Parse(const std::string& content) {
+  constexpr const char* kNameTag = "name";
+  constexpr const char* kVersionTag = "version";
+  constexpr const char* kPreInstallTag = "preInstallHook";
+  constexpr const char* kPostInstallTag = "postInstallHook";
 
-int ApexManifest::OpenInternal(std::string* error_msg) {
+  std::string name;
+  std::string preInstallHook;
+  std::string postInstallHook;
+  uint64_t version;
+
   Json::Value root;
   Json::Reader reader;
-
-  if (!reader.parse(manifest_, root)) {
-    *error_msg = StringLog() << "Failed to parse APEX Manifest JSON config: "
-                             << reader.getFormattedErrorMessages();
-    return -1;
+  if (!reader.parse(content, root)) {
+    std::string err = StringLog()
+                      << "Failed to parse APEX Manifest JSON config: "
+                      << reader.getFormattedErrorMessages();
+    return StatusOr<ApexManifest>::MakeError(err);
   }
 
-  if (!root.isMember("name")) {
-    *error_msg = StringLog()
-                 << "Missing required field \"name\" from APEX manifest.";
-    return -1;
-  }
-  Json::Value name = root["name"];
-  name_ = name.asString();
+  std::string err_str;
+  auto read_string_field = [&](const char* tag, bool req, std::string* field) {
+    if (!root.isMember(tag)) {
+      if (req) {
+        err_str = StringLog() << "Missing required field \"" << tag
+                              << "\" from APEX manifest.";
+        return false;
+      }
+      return true;
+    }
 
-  if (!root.isMember("version")) {
-    *error_msg = StringLog()
-                 << "Missing required field \"version\" from APEX manifest.";
-    return -1;
-  }
-  Json::Value version = root["version"];
-  if (!version.isUInt64()) {
-    *error_msg = StringLog()
-                 << "Invalid type for field \"version\" from APEX manifest, "
-                    "expecting integer.";
-    return -1;
-  }
-  version_ = version.asUInt64();
+    *field = root[tag].asString();
+    return true;
+  };
 
-  return 0;
+  // name
+  if (!read_string_field(kNameTag, /*req=*/true, &name)) {
+    return StatusOr<ApexManifest>::MakeError(err_str);
+  }
+
+  // version
+  if (!root.isMember(kVersionTag)) {
+    std::string err = StringLog() << "Missing required field \"" << kVersionTag
+                                  << "\" from APEX manifest.";
+    return StatusOr<ApexManifest>::MakeError(err);
+  }
+  Json::Value jVersion = root[kVersionTag];
+  if (!jVersion.isUInt64()) {
+    std::string err = StringLog()
+                      << "Invalid type for field \"" << kVersionTag
+                      << "\" from APEX manifest, expecting integer.";
+    return StatusOr<ApexManifest>::MakeError(err);
+  }
+  version = jVersion.asUInt64();
+
+  // [pre|post]InstallHook
+  if (!read_string_field(kPreInstallTag, /*req=*/false, &preInstallHook)) {
+    return StatusOr<ApexManifest>::MakeError(err_str);
+  }
+  if (!read_string_field(kPostInstallTag, /*req=*/false, &postInstallHook)) {
+    return StatusOr<ApexManifest>::MakeError(err_str);
+  }
+
+  ApexManifest manifest(name, preInstallHook, postInstallHook, version);
+  return StatusOr<ApexManifest>(std::move(manifest));
 }
 
 }  // namespace apex

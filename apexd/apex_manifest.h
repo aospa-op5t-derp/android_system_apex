@@ -17,9 +17,9 @@
 #ifndef ANDROID_APEXD_APEX_MANIFEST_H_
 #define ANDROID_APEXD_APEX_MANIFEST_H_
 
-#include <string>
+#include "status_or.h"
 
-#include <status_or.h>
+#include <string>
 
 namespace android {
 namespace apex {
@@ -27,22 +27,30 @@ namespace apex {
 // Parses an APEX manifest on construction and exposes its fields.
 class ApexManifest {
  public:
-  static StatusOr<std::unique_ptr<ApexManifest>> Open(
-      const std::string& apex_manifest);
+  static StatusOr<ApexManifest> Parse(const std::string& content);
+  ApexManifest() = delete;
+  ApexManifest(ApexManifest&&) = default;
 
-  std::string GetName() const { return name_; }
+  const std::string& GetName() const { return name_; }
   uint64_t GetVersion() const { return version_; }
-  std::string GetPackageId() const {
-    return name_ + "@" + std::to_string(version_);
-  }
+  const std::string& GetPackageId() const { return package_id_; }
+  const std::string& GetPreInstallHook() const { return preInstallHook_; }
+  const std::string& GetPostInstallHook() const { return postInstallHook_; }
 
  private:
-  ApexManifest(const std::string& apex_manifest) : manifest_(apex_manifest){};
-  int OpenInternal(std::string* error_msg);
+  ApexManifest(std::string& name, std::string& preInstallHook,
+               std::string& postInstallHook, uint64_t version)
+      : name_(std::move(name)),
+        preInstallHook_(std::move(preInstallHook)),
+        postInstallHook_(std::move(postInstallHook)),
+        version_(version),
+        package_id_(name_ + "@" + std::to_string(version_)) {}
 
-  std::string manifest_;
   std::string name_;
+  std::string preInstallHook_;
+  std::string postInstallHook_;
   uint64_t version_;
+  std::string package_id_;
 };
 
 }  // namespace apex

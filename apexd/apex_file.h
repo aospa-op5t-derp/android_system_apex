@@ -17,40 +17,62 @@
 #ifndef ANDROID_APEXD_APEX_FILE_H_
 #define ANDROID_APEXD_APEX_FILE_H_
 
-#include <ziparchive/zip_archive.h>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include <ziparchive/zip_archive.h>
+
+#include "apex_manifest.h"
 #include "status_or.h"
+
+struct AvbHashtreeDescriptor;
 
 namespace android {
 namespace apex {
+
+// Data needed to construct a valid VerityTable
+struct ApexVerityData {
+  std::unique_ptr<AvbHashtreeDescriptor> desc;
+  std::string salt;
+  std::string root_digest;
+};
 
 // Manages the content of an APEX package and provides utilities to navigate
 // the content.
 class ApexFile {
  public:
-  static StatusOr<std::unique_ptr<ApexFile>> Open(const std::string& apex_path);
-  ~ApexFile();
+  static StatusOr<ApexFile> Open(const std::string& path);
+  ApexFile() = delete;
+  ApexFile(ApexFile&&) = default;
 
-  std::string GetPath() const { return apex_path_; }
+  const std::string& GetPath() const { return apex_path_; }
   int32_t GetImageOffset() const { return image_offset_; }
   size_t GetImageSize() const { return image_size_; }
-
-  std::string GetManifest() const { return manifest_; }
+  const ApexManifest& GetManifest() const { return manifest_; }
   bool IsFlattened() const { return flattened_; }
+  const std::string& GetBundledPublicKey() const { return apex_pubkey_; }
+
+  StatusOr<ApexVerityData> VerifyApexVerity(
+      const std::vector<std::string>& apex_key_dirs) const;
 
  private:
-  ApexFile(const std::string& apex_path)
-      : apex_path_(apex_path), handle_(nullptr){};
-  int OpenInternal(std::string* error_msg);
+  ApexFile(const std::string& apex_path, bool flattened, int32_t image_offset,
+           size_t image_size, ApexManifest& manifest,
+           const std::string& apex_pubkey)
+      : apex_path_(apex_path),
+        flattened_(flattened),
+        image_offset_(image_offset),
+        image_size_(image_size),
+        manifest_(std::move(manifest)),
+        apex_pubkey_(apex_pubkey) {}
 
-  const std::string apex_path_;
+  std::string apex_path_;
   bool flattened_;
   int32_t image_offset_;
   size_t image_size_;
-  std::string manifest_;
-  ZipArchiveHandle handle_;
+  ApexManifest manifest_;
+  std::string apex_pubkey_;
 };
 
 }  // namespace apex
