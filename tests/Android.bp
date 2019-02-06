@@ -21,11 +21,22 @@ java_test_host {
 
     static_libs: ["apex_e2e_base_test"],
 
-    data: [":apex.test"],
+    data: [
+            ":apex.test",
+            ":BroadcastReceiverApp"
+    ],
 
     test_config: "apex-e2e-tests.xml",
 
     test_suites: ["general-tests"],
+}
+
+android_app {
+    name: "BroadcastReceiverApp",
+
+    srcs: ["broadcastapp/src/android/apex/broadcastreceiver/*.java"],
+
+    sdk_version: "current",
 }
 
 // Need to build test1_com.android.tzdata.apex and copy it to
@@ -45,6 +56,18 @@ java_test_host {
     test_suites: ["general-tests"],
 }
 
+java_test_host {
+    name: "apex_targetprep_tests",
+
+    libs: ["tradefed"],
+
+    data: [":apex.test"],
+
+    test_config: "apex-targetprep-tests.xml",
+
+    test_suites: ["general-tests"],
+}
+
 java_library_host {
     name: "apex_e2e_base_test",
     srcs: ["src/**/ApexE2EBaseHostTest.java"],
@@ -54,21 +77,31 @@ java_library_host {
 apex {
     name: "apex.test",
     manifest: "testdata/apex_manifest.json",
-    binaries: ["surfaceflinger", "vold"],
+    prebuilts: ["sample_prebuilt_file"],
+    key: "apex.test.key",
+    certificate: ":apex.test.certificate",
+    installable: false,
+}
+
+// This target is not consumed by anyone. It's a sanity
+// check for the build features.
+apex {
+    name: "apex_test_build_features",
+    file_contexts: "apex.test",
+    manifest: "testdata/apex_manifest.json",
+    // binaries: ["surfaceflinger", "vold"],
     multilib: {
-        lib32: {
-            binaries: ["drmserver"],
-        },
         prefer32: {
             binaries: ["dex2oat"],
         },
     },
-    native_shared_libs: ["libc", "libcutils"],
-    java_libs: ["core-oj"],
+    // native_shared_libs: ["libc", "libcutils"],
+    java_libs: ["conscrypt"],
     prebuilts: ["sample_prebuilt_file", "apex.test.ld.config.txt", "apex.test.init.rc"],
     compile_multilib: "both",
     key: "apex.test.key",
     certificate: ":apex.test.certificate",
+    installable: false,
 }
 
 apex_key {

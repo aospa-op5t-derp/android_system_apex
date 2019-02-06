@@ -789,8 +789,6 @@ void scanStagedSessionsDirAndStage() {
     }
 
     // Run postinstall, if necessary.
-    // TODO(b/118865310): this should be over the session of sessions,
-    //                    including all packages.
     Status postinstall_status = postinstallPackages(apexes);
     if (!postinstall_status.Ok()) {
       LOG(ERROR) << "Postinstall failed for session "
@@ -798,9 +796,6 @@ void scanStagedSessionsDirAndStage() {
                  << postinstall_status.ErrorMessage();
       continue;
     }
-
-    // TODO(b/118865310): double check that there is only one apex file per
-    // dir?
 
     const Status result = stagePackages(apexes, /* linkPackages */ true);
     if (!result.Ok()) {
@@ -907,7 +902,14 @@ Status stagePackages(const std::vector<std::string>& tmpPaths,
   return Status::Success();
 }
 
+Status rollbackLastSession() {
+  // TODO Unstage newly staged packages and call Checkpoint#abortCheckpoint
+  LOG(INFO) << "Rolling back last session";
+  return Status::Success();
+}
+
 void onStart() {
+  LOG(INFO) << "Marking APEXd as starting";
   if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusStarting;
@@ -920,6 +922,7 @@ void onAllPackagesReady() {
   // they can query this system property to ensure that they are okay to
   // access. Or they may have a on-property trigger to delay a task until
   // APEXs become ready.
+  LOG(INFO) << "Marking APEXd as ready";
   if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusReady)) {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusReady;
@@ -955,12 +958,32 @@ StatusOr<std::vector<ApexFile>> submitStagedSession(
     return StatusOr<std::vector<ApexFile>>::MakeError(session.ErrorMessage());
   }
   (*session).SetChildSessionIds(child_session_ids);
-  Status commit_status = (*session).UpdateStateAndCommit(SessionState::STAGED);
+  Status commit_status =
+      (*session).UpdateStateAndCommit(SessionState::VERIFIED);
   if (!commit_status.Ok()) {
     return StatusOr<std::vector<ApexFile>>::MakeError(commit_status);
   }
 
   return StatusOr<std::vector<ApexFile>>(std::move(ret));
+}
+
+Status markStagedSessionReady(const int session_id) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.Ok()) {
+    return session.ErrorStatus();
+  }
+  // We should only accept sessions in SessionState::VERIFIED or
+  // SessionState::STAGED state. In the SessionState::STAGED case, this
+  // function is effectively a no-op.
+  auto session_state = (*session).GetState();
+  if (session_state == SessionState::STAGED) {
+    return Status::Success();
+  }
+  if (session_state == SessionState::VERIFIED) {
+    return (*session).UpdateStateAndCommit(SessionState::STAGED);
+  }
+  return Status::Fail(StringLog() << "Invalid state for session " << session_id
+                                  << ". Cannot mark it as ready.");
 }
 
 }  // namespace apex
