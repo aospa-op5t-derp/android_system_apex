@@ -14,15 +14,25 @@
  * limitations under the License.
  */
 
-package android.apex;
+package android.apex.broadcastreceiver;
 
-parcelable ApexSessionInfo {
-    int sessionId;
-    // Maps to apex::proto::SessionState::State enum.
-    boolean isUnknown;
-    boolean isVerified;
-    boolean isStaged;
-    boolean isActivated;
-    boolean isActivationPendingRetry;
-    boolean isActivationFailed;
+import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.os.Bundle;
+
+/**
+ * Main activity to listen to broadcast session updates.
+ *
+ */
+public class MainActivity extends Activity {
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        BroadcastReceiver br = new BroadcastReceiverActivity();
+
+        IntentFilter filter = new IntentFilter("android.content.pm.action.SESSION_UPDATED");
+        this.registerReceiver(br, filter);
+    }
 }

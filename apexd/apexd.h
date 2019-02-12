@@ -48,6 +48,8 @@ Status stagePackages(const std::vector<std::string>& tmpPaths,
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id,
     const std::vector<int>& child_session_ids) WARN_UNUSED;
+Status markStagedSessionReady(const int session_id) WARN_UNUSED;
+Status rollbackLastSession();
 
 Status activatePackage(const std::string& full_path) WARN_UNUSED;
 Status deactivatePackage(const std::string& full_path) WARN_UNUSED;

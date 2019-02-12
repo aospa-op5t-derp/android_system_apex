@@ -1,5 +1,6 @@
-/*
- * Copyright (C) 2018 The Android Open Source Project
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,21 +13,16 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- */
+ -->
 
-#ifndef ANDROID_APEX_APEX_SERVICE_H
-#define ANDROID_APEX_APEX_SERVICE_H
-
-namespace android {
-namespace apex {
-namespace binder {
-
-void CreateAndRegisterService();
-void StartThreadPool();
-void JoinThreadPool();
-
-}  // namespace binder
-}  // namespace apex
-}  // namespace android
-
-#endif  // ANDROID_APEX_APEX_SERVICE_H
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="android.apex.broadcastreceiver">
+    <application>
+        <activity android:name=".MainActivity" >
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
