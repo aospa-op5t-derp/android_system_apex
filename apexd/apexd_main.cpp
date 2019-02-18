@@ -21,7 +21,7 @@
 #include <android-base/logging.h>
 
 #include "apexd.h"
-#include "apexd_preinstall.h"
+#include "apexd_prepostinstall.h"
 #include "apexservice.h"
 
 namespace {
@@ -30,6 +30,11 @@ int HandleSubcommand(char** argv) {
   if (strcmp("--pre-install", argv[1]) == 0) {
     LOG(INFO) << "Preinstall subcommand detected";
     return android::apex::RunPreInstall(argv);
+  }
+
+  if (strcmp("--post-install", argv[1]) == 0) {
+    LOG(INFO) << "Postinstall subcommand detected";
+    return android::apex::RunPostInstall(argv);
   }
 
   LOG(ERROR) << "Unknown subcommand: " << argv[1];
@@ -53,6 +58,9 @@ int main(int /*argc*/, char** argv) {
   android::apex::binder::CreateAndRegisterService();
 
   android::apex::unmountAndDetachExistingImages();
+
+  android::apex::scanStagedSessionsDirAndStage();
+
   // Scan the directory under /data first, as it may contain updates of APEX
   // packages living in the directory under /system, and we want the former ones
   // to be used over the latter ones.

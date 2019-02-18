@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_APEXD_APEXD_PREINSTALL_H_
-#define ANDROID_APEXD_APEXD_PREINSTALL_H_
+#ifndef ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
+#define ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
 
 #include <string>
 #include <vector>
@@ -27,11 +27,13 @@ namespace apex {
 
 class ApexFile;
 
-Status StagePreInstall(std::vector<ApexFile>& apexes);
-
+Status StagePreInstall(const std::vector<ApexFile>& apexes);
 int RunPreInstall(char** argv);
+
+Status StagePostInstall(const std::vector<ApexFile>& apexes);
+int RunPostInstall(char** argv);
 
 }  // namespace apex
 }  // namespace android
 
-#endif  // ANDROID_APEXD_APEXD_PREINSTALL_H_
+#endif  // ANDROID_APEXD_APEXD_PREPOSTINSTALL_H_
