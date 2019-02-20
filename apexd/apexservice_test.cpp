@@ -219,8 +219,8 @@ class ApexServiceTest : public ::testing::Test {
       package = manifest.name();
       version = manifest.version();
 
-      test_installed_file = std::string(kApexPackageDataDir) + "/" + package +
-                            "@" + std::to_string(version) + ".apex";
+      test_installed_file = std::string(kActiveApexPackagesDataDir) + "/" +
+                            package + "@" + std::to_string(version) + ".apex";
     }
 
     bool Prepare() {
@@ -306,8 +306,8 @@ class ApexServiceTest : public ::testing::Test {
     }
 
     log << "active=[" << Join(GetActivePackagesStrings(), ',') << "] ";
-    log << kApexPackageDataDir << "=["
-        << Join(ListDir(kApexPackageDataDir), ',') << "] ";
+    log << kActiveApexPackagesDataDir << "=["
+        << Join(ListDir(kActiveApexPackagesDataDir), ',') << "] ";
     log << kApexRoot << "=[" << Join(ListDir(kApexRoot), ',') << "]";
 
     return log;
@@ -433,6 +433,32 @@ TEST_F(ApexServiceTest, StageSuccess) {
   ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
   ASSERT_TRUE(success);
   EXPECT_TRUE(RegularFileExists(installer.test_installed_file));
+}
+
+TEST_F(ApexServiceTest, StageSuccess_ClearsPreviouslyActivePackage) {
+  PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test_v2.apex"));
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"));
+  PrepareTestApexForInstall installer3(GetTestFile("apex.apexd_test.apex"));
+  auto install_fn = [&](PrepareTestApexForInstall& installer) {
+    if (!installer.Prepare()) {
+      return;
+    }
+    bool success;
+    android::binder::Status st =
+        service_->stagePackage(installer.test_file, &success);
+    ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
+    ASSERT_TRUE(success);
+    EXPECT_TRUE(RegularFileExists(installer.test_installed_file));
+  };
+  install_fn(installer1);
+  install_fn(installer2);
+  // Simulating a rollback. After this call test_v2_apex_path should be removed.
+  install_fn(installer3);
+
+  EXPECT_FALSE(RegularFileExists(installer1.test_installed_file));
+  EXPECT_TRUE(RegularFileExists(installer2.test_installed_file));
+  EXPECT_TRUE(RegularFileExists(installer3.test_installed_file));
 }
 
 TEST_F(ApexServiceTest, MultiStageSuccess) {
@@ -612,7 +638,7 @@ class ApexServicePrePostInstallTest : public ApexServiceTest {
  public:
   template <typename Fn>
   void RunPrePost(Fn fn, const std::vector<std::string>& apex_names,
-                  const char* test_message) {
+                  const char* test_message, bool expect_success = true) {
     // Using unique_ptr is just the easiest here.
     using InstallerUPtr = std::unique_ptr<PrepareTestApexForInstall>;
     std::vector<InstallerUPtr> installers;
@@ -628,10 +654,16 @@ class ApexServicePrePostInstallTest : public ApexServiceTest {
       installers.emplace_back(std::move(installer));
     }
     android::binder::Status st = (service_.get()->*fn)(pkgs);
-    ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
+    if (expect_success) {
+      ASSERT_TRUE(st.isOk()) << st.toString8().c_str();
+    } else {
+      ASSERT_FALSE(st.isOk());
+    }
 
-    std::string logcat = GetLogcat();
-    EXPECT_NE(std::string::npos, logcat.find(test_message)) << logcat;
+    if (test_message != nullptr) {
+      std::string logcat = GetLogcat();
+      EXPECT_NE(std::string::npos, logcat.find(test_message)) << logcat;
+    }
 
     // Ensure that the package is neither active nor mounted.
     for (const InstallerUPtr& installer : installers) {
@@ -665,6 +697,12 @@ TEST_F(ApexServicePrePostInstallTest, MultiPreinstall) {
              kLogcatText);
 }
 
+TEST_F(ApexServicePrePostInstallTest, PreinstallFail) {
+  RunPrePost(&IApexService::preinstallPackages,
+             {"apex.apexd_test_prepostinstall.fail.apex"},
+             /* test_message= */ nullptr, /* expect_success= */ false);
+}
+
 TEST_F(ApexServicePrePostInstallTest, Postinstall) {
   RunPrePost(&IApexService::postinstallPackages,
              {"apex.apexd_test_postinstall.apex"},
@@ -677,6 +715,12 @@ TEST_F(ApexServicePrePostInstallTest, MultiPostinstall) {
   RunPrePost(&IApexService::postinstallPackages,
              {"apex.apexd_test_postinstall.apex", "apex.apexd_test.apex"},
              kLogcatText);
+}
+
+TEST_F(ApexServicePrePostInstallTest, PostinstallFail) {
+  RunPrePost(&IApexService::postinstallPackages,
+             {"apex.apexd_test_prepostinstall.fail.apex"},
+             /* test_message= */ nullptr, /* expect_success= */ false);
 }
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
