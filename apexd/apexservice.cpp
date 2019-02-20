@@ -63,6 +63,7 @@ class ApexService : public BnApexService {
                                    bool* aidl_return) override;
   BinderStatus markStagedSessionReady(int session_id,
                                       bool* aidl_return) override;
+  BinderStatus markStagedSessionSuccessful(int session_id) override;
   BinderStatus getSessions(std::vector<ApexSessionInfo>* aidl_return) override;
   BinderStatus getStagedSessionInfo(
       int session_id, ApexSessionInfo* apex_session_info) override;
@@ -81,7 +82,7 @@ class ApexService : public BnApexService {
 
   // Override onTransact so we can handle shellCommand.
   status_t onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
-                      Parcel* _aidl_reply, uint32_t _aidl_flags = 0) override;
+                      Parcel* _aidl_reply, uint32_t _aidl_flags) override;
 
   status_t shellCommand(int in, int out, int err, const Vector<String16>& args);
 };
@@ -97,6 +98,10 @@ BinderStatus CheckDebuggable(const std::string& name) {
 
 BinderStatus ApexService::stagePackage(const std::string& packageTmpPath,
                                        bool* aidl_return) {
+  BinderStatus debugCheck = CheckDebuggable("stagePackage");
+  if (!debugCheck.isOk()) {
+    return debugCheck;
+  }
   std::vector<std::string> tmp;
   tmp.push_back(packageTmpPath);
   return stagePackages(tmp, aidl_return);
@@ -104,6 +109,10 @@ BinderStatus ApexService::stagePackage(const std::string& packageTmpPath,
 
 BinderStatus ApexService::stagePackages(const std::vector<std::string>& paths,
                                         bool* aidl_return) {
+  BinderStatus debugCheck = CheckDebuggable("stagePackages");
+  if (!debugCheck.isOk()) {
+    return debugCheck;
+  }
   LOG(DEBUG) << "stagePackages() received by ApexService, paths "
              << android::base::Join(paths, ',');
 
@@ -163,6 +172,20 @@ BinderStatus ApexService::markStagedSessionReady(int session_id,
   return BinderStatus::ok();
 }
 
+BinderStatus ApexService::markStagedSessionSuccessful(int session_id) {
+  LOG(DEBUG)
+      << "markStagedSessionSuccessful() received by ApexService, session id "
+      << session_id;
+  Status ret = ::android::apex::markStagedSessionSuccessful(session_id);
+  if (!ret.Ok()) {
+    LOG(ERROR) << "Failed to mark session " << session_id
+               << " as SUCCESS: " << ret.ErrorMessage();
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(ret.ErrorMessage().c_str()));
+  }
+  return BinderStatus::ok();
+}
+
 void convertToApexSessionInfo(const ApexSession& session,
                               ApexSessionInfo* session_info) {
   using SessionState = ::apex::proto::SessionState;
@@ -174,6 +197,7 @@ void convertToApexSessionInfo(const ApexSession& session,
   session_info->isActivated = false;
   session_info->isActivationPendingRetry = false;
   session_info->isActivationFailed = false;
+  session_info->isSuccess = false;
 
   switch (session.GetState()) {
     case SessionState::VERIFIED:
@@ -185,11 +209,11 @@ void convertToApexSessionInfo(const ApexSession& session,
     case SessionState::ACTIVATED:
       session_info->isActivated = true;
       break;
-    case SessionState::ACTIVATION_PENDING_RETRY:
-      session_info->isActivationPendingRetry = true;
-      break;
     case SessionState::ACTIVATION_FAILED:
       session_info->isActivationFailed = true;
+      break;
+    case SessionState::SUCCESS:
+      session_info->isSuccess = true;
       break;
     case SessionState::UNKNOWN:
     default:
@@ -224,6 +248,7 @@ BinderStatus ApexService::getStagedSessionInfo(
     apex_session_info->isActivated = false;
     apex_session_info->isActivationPendingRetry = false;
     apex_session_info->isActivationFailed = false;
+    apex_session_info->isSuccess = false;
     return BinderStatus::ok();
   }
 
@@ -341,7 +366,12 @@ BinderStatus ApexService::postinstallPackages(
 }
 
 BinderStatus ApexService::abortActiveSession() {
-  // TODO: Implement.
+  LOG(DEBUG) << "abortActiveSession() received by ApexService.";
+  Status res = ::android::apex::abortActiveSession();
+  if (!res.Ok()) {
+    return BinderStatus::fromExceptionCode(BinderStatus::EX_ILLEGAL_ARGUMENT,
+                                           String8(res.ErrorMessage().c_str()));
+  }
   return BinderStatus::ok();
 }
 
