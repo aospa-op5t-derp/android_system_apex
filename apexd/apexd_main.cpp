@@ -22,6 +22,7 @@
 
 #include "apexd.h"
 #include "apexd_prepostinstall.h"
+#include "apexd_prop.h"
 #include "apexservice.h"
 
 namespace {
@@ -41,10 +42,24 @@ int HandleSubcommand(char** argv) {
   return 1;
 }
 
+struct CombinedLogger {
+  android::base::LogdLogger logd;
+
+  CombinedLogger() {}
+
+  void operator()(android::base::LogId id, android::base::LogSeverity severity,
+                  const char* tag, const char* file, unsigned int line,
+                  const char* message) {
+    logd(id, severity, tag, file, line, message);
+    KernelLogger(id, severity, tag, file, line, message);
+  }
+};
+
 }  // namespace
 
 int main(int /*argc*/, char** argv) {
-  android::base::InitLogging(argv);
+  // Use CombinedLogger to also log to the kernel log.
+  android::base::InitLogging(argv, CombinedLogger());
 
   if (argv[1] != nullptr) {
     return HandleSubcommand(argv);
@@ -71,6 +86,10 @@ int main(int /*argc*/, char** argv) {
   // Notify other components (e.g. init) that all APEXs are correctly mounted
   // and are ready to be used.
   android::apex::onAllPackagesReady();
+
+  android::apex::binder::StartThreadPool();
+
+  android::apex::waitForBootStatus(android::apex::rollbackLastSession);
 
   android::apex::binder::JoinThreadPool();
 
