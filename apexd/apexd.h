@@ -31,15 +31,18 @@ namespace apex {
 
 static constexpr const char* kApexDataDir = "/data/apex";
 static constexpr const char* kActiveApexPackagesDataDir = "/data/apex/active";
+static constexpr const char* kApexBackupDir = "/data/apex/backup";
 static constexpr const char* kApexPackageSystemDir = "/system/apex";
 static constexpr const char* kApexRoot = "/apex";
-static constexpr const char* kStagedSessionsDir = "/data/staging";
+static constexpr const char* kStagedSessionsDir = "/data/pkg_staging";
+
+Status resumeRollbackIfNeeded();
 
 void startBootSequence();
 
 void unmountAndDetachExistingImages();
 
-void scanPackagesDirAndActivate(const char* apex_package_dir);
+Status scanPackagesDirAndActivate(const char* apex_package_dir);
 void scanStagedSessionsDirAndStage();
 
 Status preinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;

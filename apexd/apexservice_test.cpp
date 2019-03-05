@@ -33,6 +33,7 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <binder/IServiceManager.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <selinux/selinux.h>
 
@@ -57,36 +58,15 @@ namespace apex {
 
 using android::sp;
 using android::String16;
+using android::apex::testing::CreateSessionInfo;
 using android::apex::testing::IsOk;
+using android::apex::testing::SessionInfoEq;
 using android::base::Join;
+using android::base::StringPrintf;
+using ::testing::UnorderedElementsAre;
+using ::testing::UnorderedElementsAreArray;
 
-struct SessionsCleaner {
-  std::unordered_set<std::string> original_sessions_;
-
-  SessionsCleaner() {}
-
-  void Init() {
-    auto sessions =
-        ReadDir(kApexSessionsDir, [](auto _, auto __) { return true; });
-    ASSERT_TRUE(IsOk(sessions));
-    std::copy(sessions->begin(), sessions->end(),
-              std::inserter(original_sessions_, original_sessions_.end()));
-  }
-
-  void Clear() {
-    auto sessions =
-        ReadDir(kApexSessionsDir, [](auto _, auto __) { return true; });
-    ASSERT_TRUE(IsOk(sessions)) << "Failed to list " << kApexSessionsDir;
-    for (const auto& session : *sessions) {
-      if (original_sessions_.find(session) == original_sessions_.end()) {
-        std::error_code error_code;
-        std::filesystem::remove_all(std::filesystem::path(session), error_code);
-        ASSERT_FALSE(error_code)
-            << "Failed to delete " << session << " : " << error_code;
-      }
-    }
-  }
-};
+namespace fs = std::filesystem;
 
 class ApexServiceTest : public ::testing::Test {
  public:
@@ -104,10 +84,10 @@ class ApexServiceTest : public ::testing::Test {
  protected:
   void SetUp() override {
     ASSERT_NE(nullptr, service_.get());
-    cleaner_.Init();
+    CleanUp();
   }
 
-  void TearDown() override { cleaner_.Clear(); }
+  void TearDown() override { CleanUp(); }
 
   static std::string GetTestDataDir() {
     return android::base::GetExecutableDirectory();
@@ -159,7 +139,7 @@ class ApexServiceTest : public ::testing::Test {
     std::vector<ApexInfo> list;
     android::binder::Status status = service_->getActivePackages(&list);
     if (status.isOk()) {
-      std::vector<std::string> ret;
+      std::vector<std::string> ret(list.size());
       for (const ApexInfo& p : list) {
         ret.push_back(p.packageName + "@" + std::to_string(p.versionCode) +
                       " [path=" + p.packagePath + "]");
@@ -226,7 +206,7 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   struct PrepareTestApexForInstall {
-    static constexpr const char* kTestDir = "/data/staging/apexservice_tmp";
+    static constexpr const char* kTestDir = "/data/pkg_staging/apexservice_tmp";
 
     // This is given to the constructor.
     std::string test_input;  // Original test file.
@@ -356,57 +336,23 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   sp<IApexService> service_;
-  SessionsCleaner cleaner_;
+
+ private:
+  void CleanUp() {
+    for (const auto& p : fs::directory_iterator(kApexDataDir)) {
+      std::error_code ec;
+      if (p.is_directory()) {
+        fs::remove_all(p.path(), ec);
+        ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : " << ec;
+      } else {
+        fs::remove(p.path(), ec);
+        ASSERT_FALSE(ec) << "Failed to delete " << p.path() << " : " << ec;
+      }
+    }
+  }
 };
 
 namespace {
-
-ApexSessionInfo createSessionInfo(int session_id) {
-  ApexSessionInfo info;
-  info.sessionId = session_id;
-  info.isUnknown = false;
-  info.isVerified = false;
-  info.isStaged = false;
-  info.isActivated = false;
-  info.isActivationPendingRetry = false;
-  info.isActivationFailed = false;
-  info.isSuccess = false;
-  return info;
-}
-
-void ExpectSessionsEqual(const ApexSessionInfo& lhs,
-                         const ApexSessionInfo& rhs) {
-  EXPECT_EQ(lhs.sessionId, rhs.sessionId);
-  EXPECT_EQ(lhs.isUnknown, rhs.isUnknown);
-  EXPECT_EQ(lhs.isVerified, rhs.isVerified);
-  EXPECT_EQ(lhs.isStaged, rhs.isStaged);
-  EXPECT_EQ(lhs.isActivated, rhs.isActivated);
-  EXPECT_EQ(lhs.isActivationPendingRetry, rhs.isActivationPendingRetry);
-  EXPECT_EQ(lhs.isActivationFailed, rhs.isActivationFailed);
-  EXPECT_EQ(lhs.isSuccess, rhs.isSuccess);
-}
-
-void ExpectSessionsContainAllOf(const std::vector<ApexSessionInfo>& actual,
-                                const std::vector<ApexSessionInfo>& expected) {
-  for (const auto& se : expected) {
-    bool found = false;
-    for (const auto& sa : actual) {
-      if (se.sessionId == sa.sessionId) {
-        found = true;
-        ExpectSessionsEqual(se, sa);
-        break;
-      }
-    }
-    EXPECT_TRUE(found) << "Session " << se.sessionId << " not found";
-  }
-}
-
-void ExpectSessionsContainExactly(
-    const std::vector<ApexSessionInfo>& actual,
-    const std::vector<ApexSessionInfo>& expected) {
-  EXPECT_EQ(actual.size(), expected.size());
-  ExpectSessionsContainAllOf(actual, expected);
-}
 
 bool RegularFileExists(const std::string& path) {
   struct stat buf;
@@ -490,7 +436,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
 
   constexpr const char* kExpectedError3 =
       "Error verifying "
-      "/data/staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
+      "/data/pkg_staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
       "couldn't verify public key: Failed to compare the bundled public key "
       "with key";
   const size_t pos3 = error.find(kExpectedError3);
@@ -610,13 +556,16 @@ class ApexServiceActivationTest : public ApexServiceTest {
   }
 
   void TearDown() override {
-    ApexServiceTest::TearDown();
     // Attempt to deactivate.
     if (installer_ != nullptr) {
       service_->deactivatePackage(installer_->test_installed_file);
     }
 
     installer_.reset();
+    // ApexServiceTest::TearDown will wipe out everything under /data/apex.
+    // Since some of that information is required for deactivePackage binder
+    // call, it's required to be called after deactivating package.
+    ApexServiceTest::TearDown();
   }
 
   std::unique_ptr<PrepareTestApexForInstall> installer_;
@@ -696,7 +645,7 @@ TEST_F(ApexServiceActivationSuccessTest, GetActivePackages) {
   ASSERT_TRUE(IsOk(active));
   ApexInfo match;
 
-  for (ApexInfo info : *active) {
+  for (const ApexInfo& info : *active) {
     if (info.packageName == installer_->package) {
       match = info;
       break;
@@ -811,7 +760,7 @@ TEST_F(ApexServicePrePostInstallTest, PostinstallFail) {
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/staging/session_123",
+                                      "/data/pkg_staging/session_123",
                                       "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
@@ -826,7 +775,7 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
   EXPECT_TRUE(ret_value);
   EXPECT_EQ(1u, list.apexInfos.size());
   ApexInfo match;
-  for (ApexInfo info : list.apexInfos) {
+  for (const ApexInfo& info : list.apexInfos) {
     if (info.packageName == installer.package) {
       match = info;
       break;
@@ -840,14 +789,9 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
   ApexSessionInfo session;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(123, &session)))
       << GetDebugStr(&installer);
-  EXPECT_EQ(123, session.sessionId);
-  EXPECT_FALSE(session.isUnknown);
-  EXPECT_TRUE(session.isVerified);
-  EXPECT_FALSE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(123);
+  expected.isVerified = true;
+  EXPECT_THAT(session, SessionInfoEq(expected));
 
   ASSERT_TRUE(IsOk(service_->markStagedSessionReady(123, &ret_value)))
       << GetDebugStr(&installer);
@@ -855,14 +799,9 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
 
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(123, &session)))
       << GetDebugStr(&installer);
-  EXPECT_EQ(123, session.sessionId);
-  EXPECT_FALSE(session.isUnknown);
-  EXPECT_FALSE(session.isVerified);
-  EXPECT_TRUE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  expected.isVerified = false;
+  expected.isStaged = true;
+  EXPECT_THAT(session, SessionInfoEq(expected));
 
   // Call markStagedSessionReady again. Should be a no-op.
   ASSERT_TRUE(IsOk(service_->markStagedSessionReady(123, &ret_value)))
@@ -871,32 +810,18 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
 
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(123, &session)))
       << GetDebugStr(&installer);
-  EXPECT_EQ(123, session.sessionId);
-  EXPECT_FALSE(session.isUnknown);
-  EXPECT_FALSE(session.isVerified);
-  EXPECT_TRUE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  EXPECT_THAT(session, SessionInfoEq(expected));
 
   // See if the session is reported with getSessions() as well
   std::vector<ApexSessionInfo> sessions;
   ASSERT_TRUE(IsOk(service_->getSessions(&sessions)))
       << GetDebugStr(&installer);
-  // TODO it appears there is some left-over staged state, and we get 2 sessions
-  // here EXPECT_EQ(1u, sessions.size()); So for now, only compare the session
-  // with the same sessionid
-  for (const auto& s : sessions) {
-    if (s.sessionId == session.sessionId) {
-      ExpectSessionsEqual(s, session);
-    }
-  }
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected)));
 }
 
 TEST_F(ApexServiceTest, SubmitSingleStagedSession_AbortsNonFinalSessions) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/staging/session_239",
+                                      "/data/pkg_staging/session_239",
                                       "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
@@ -916,15 +841,15 @@ TEST_F(ApexServiceTest, SubmitSingleStagedSession_AbortsNonFinalSessions) {
   std::vector<ApexSessionInfo> sessions;
   ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
 
-  ApexSessionInfo expected_session1 = createSessionInfo(37);
+  ApexSessionInfo expected_session1 = CreateSessionInfo(37);
   expected_session1.isVerified = true;
-  ApexSessionInfo expected_session2 = createSessionInfo(57);
+  ApexSessionInfo expected_session2 = CreateSessionInfo(57);
   expected_session2.isStaged = true;
-  ApexSessionInfo expected_session3 = createSessionInfo(73);
+  ApexSessionInfo expected_session3 = CreateSessionInfo(73);
   expected_session3.isSuccess = true;
-  std::vector<ApexSessionInfo> expected{expected_session1, expected_session2,
-                                        expected_session3};
-  ExpectSessionsContainAllOf(sessions, expected);
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected_session1),
+                                             SessionInfoEq(expected_session2),
+                                             SessionInfoEq(expected_session3)));
 
   ApexInfoList list;
   bool ret_value;
@@ -936,16 +861,16 @@ TEST_F(ApexServiceTest, SubmitSingleStagedSession_AbortsNonFinalSessions) {
   sessions.clear();
   ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
 
-  ApexSessionInfo expected_session4 = createSessionInfo(239);
+  ApexSessionInfo expected_session4 = CreateSessionInfo(239);
   expected_session4.isVerified = true;
-  ExpectSessionsContainExactly(sessions,
-                               {expected_session3, expected_session4});
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected_session3),
+                                             SessionInfoEq(expected_session4)));
 }
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"),
-      "/data/staging/session_456", "staging_data_file");
+      "/data/pkg_staging/session_456", "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
   }
@@ -961,25 +886,20 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   ApexSessionInfo session;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(456, &session)))
       << GetDebugStr(&installer);
-  EXPECT_EQ(-1, session.sessionId);
-  EXPECT_TRUE(session.isUnknown);
-  EXPECT_FALSE(session.isVerified);
-  EXPECT_FALSE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(-1);
+  expected.isUnknown = true;
+  EXPECT_THAT(session, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   // Parent session id: 10
   // Children session ids: 20 30
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/staging/session_20",
+                                      "/data/pkg_staging/session_20",
                                       "staging_data_file");
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"),
-      "/data/staging/session_30", "staging_data_file");
+      "/data/pkg_staging/session_30", "staging_data_file");
   if (!installer.Prepare() || !installer2.Prepare()) {
     FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
   }
@@ -995,7 +915,7 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   ApexInfo match;
   bool package1_found = false;
   bool package2_found = false;
-  for (ApexInfo info : list.apexInfos) {
+  for (const ApexInfo& info : list.apexInfos) {
     if (info.packageName == installer.package) {
       ASSERT_EQ(installer.package, info.packageName);
       ASSERT_EQ(installer.version, static_cast<uint64_t>(info.versionCode));
@@ -1017,14 +937,9 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   ApexSessionInfo session;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(10, &session)))
       << GetDebugStr(&installer);
-  EXPECT_EQ(10, session.sessionId);
-  EXPECT_FALSE(session.isUnknown);
-  EXPECT_TRUE(session.isVerified);
-  EXPECT_FALSE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(10);
+  expected.isVerified = true;
+  ASSERT_THAT(session, SessionInfoEq(expected));
 
   ASSERT_TRUE(IsOk(service_->markStagedSessionReady(10, &ret_value)))
       << GetDebugStr(&installer);
@@ -1032,24 +947,20 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
 
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(10, &session)))
       << GetDebugStr(&installer);
-  EXPECT_FALSE(session.isUnknown);
-  EXPECT_FALSE(session.isVerified);
-  EXPECT_TRUE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  expected.isVerified = false;
+  expected.isStaged = true;
+  ASSERT_THAT(session, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, SubmitMultiSessionTestFail) {
   // Parent session id: 11
   // Children session ids: 21 31
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/staging/session_21",
+                                      "/data/pkg_staging/session_21",
                                       "staging_data_file");
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_no_inst_key.apex"),
-      "/data/staging/session_31", "staging_data_file");
+      "/data/pkg_staging/session_31", "staging_data_file");
   if (!installer.Prepare() || !installer2.Prepare()) {
     FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
   }
@@ -1070,14 +981,9 @@ TEST_F(ApexServiceTest, MarkStagedSessionReadyFail) {
 
   ApexSessionInfo session;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(666, &session)));
-  EXPECT_EQ(-1, session.sessionId);
-  EXPECT_TRUE(session.isUnknown);
-  EXPECT_FALSE(session.isVerified);
-  EXPECT_FALSE(session.isStaged);
-  EXPECT_FALSE(session.isActivated);
-  EXPECT_FALSE(session.isActivationPendingRetry);
-  EXPECT_FALSE(session.isActivationFailed);
-  EXPECT_FALSE(session.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(-1);
+  expected.isUnknown = true;
+  ASSERT_THAT(session, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulFailsNoSession) {
@@ -1085,14 +991,9 @@ TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulFailsNoSession) {
 
   ApexSessionInfo session_info;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(37, &session_info)));
-  EXPECT_EQ(-1, session_info.sessionId);
-  EXPECT_TRUE(session_info.isUnknown);
-  EXPECT_FALSE(session_info.isVerified);
-  EXPECT_FALSE(session_info.isStaged);
-  EXPECT_FALSE(session_info.isActivated);
-  EXPECT_FALSE(session_info.isActivationPendingRetry);
-  EXPECT_FALSE(session_info.isActivationFailed);
-  EXPECT_FALSE(session_info.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(-1);
+  expected.isUnknown = true;
+  ASSERT_THAT(session_info, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulFailsSessionInWrongState) {
@@ -1105,14 +1006,9 @@ TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulFailsSessionInWrongState) {
 
   ApexSessionInfo session_info;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(73, &session_info)));
-  EXPECT_EQ(73, session_info.sessionId);
-  EXPECT_FALSE(session_info.isUnknown);
-  EXPECT_FALSE(session_info.isVerified);
-  EXPECT_TRUE(session_info.isStaged);
-  EXPECT_FALSE(session_info.isActivated);
-  EXPECT_FALSE(session_info.isActivationPendingRetry);
-  EXPECT_FALSE(session_info.isActivationFailed);
-  EXPECT_FALSE(session_info.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(73);
+  expected.isStaged = true;
+  ASSERT_THAT(session_info, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulActivatedSession) {
@@ -1125,14 +1021,9 @@ TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulActivatedSession) {
 
   ApexSessionInfo session_info;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(239, &session_info)));
-  EXPECT_EQ(239, session_info.sessionId);
-  EXPECT_FALSE(session_info.isUnknown);
-  EXPECT_FALSE(session_info.isVerified);
-  EXPECT_FALSE(session_info.isStaged);
-  EXPECT_FALSE(session_info.isActivated);
-  EXPECT_FALSE(session_info.isActivationPendingRetry);
-  EXPECT_FALSE(session_info.isActivationFailed);
-  EXPECT_TRUE(session_info.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(239);
+  expected.isSuccess = true;
+  ASSERT_THAT(session_info, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulNoOp) {
@@ -1145,14 +1036,9 @@ TEST_F(ApexServiceTest, MarkStagedSessionSuccessfulNoOp) {
 
   ApexSessionInfo session_info;
   ASSERT_TRUE(IsOk(service_->getStagedSessionInfo(1543, &session_info)));
-  EXPECT_EQ(1543, session_info.sessionId);
-  EXPECT_FALSE(session_info.isUnknown);
-  EXPECT_FALSE(session_info.isVerified);
-  EXPECT_FALSE(session_info.isStaged);
-  EXPECT_FALSE(session_info.isActivated);
-  EXPECT_FALSE(session_info.isActivationPendingRetry);
-  EXPECT_FALSE(session_info.isActivationFailed);
-  EXPECT_TRUE(session_info.isSuccess);
+  ApexSessionInfo expected = CreateSessionInfo(1543);
+  expected.isSuccess = true;
+  ASSERT_THAT(session_info, SessionInfoEq(expected));
 }
 
 TEST_F(ApexServiceTest, AbortActiveSessionNoSessions) {
@@ -1176,6 +1062,356 @@ TEST_F(ApexServiceTest, AbortActiveSession) {
   sessions.clear();
   ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
   ASSERT_EQ(0u, sessions.size());
+}
+
+TEST_F(ApexServiceTest, BackupActivePackages) {
+  PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"));
+  PrepareTestApexForInstall installer3(GetTestFile("apex.apexd_test_v2.apex"),
+                                       "/data/pkg_staging/session_23",
+                                       "staging_data_file");
+
+  if (!installer1.Prepare() || !installer2.Prepare() || !installer3.Prepare()) {
+    return;
+  }
+
+  // Activate some packages, in order to backup them later.
+  bool ret = false;
+  std::vector<std::string> pkgs = {installer1.test_file, installer2.test_file};
+  ASSERT_TRUE(IsOk(service_->stagePackages(pkgs, &ret)));
+  ASSERT_TRUE(ret);
+
+  // Make sure that /data/apex/active has activated packages.
+  auto active_pkgs = ReadDir(std::string(kActiveApexPackagesDataDir),
+                             [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_pkgs));
+  ASSERT_THAT(*active_pkgs,
+              UnorderedElementsAre(installer1.test_installed_file,
+                                   installer2.test_installed_file));
+
+  ApexInfoList list;
+  std::vector<int> empty_child_session_ids;
+  ASSERT_TRUE(IsOk(
+      service_->submitStagedSession(23, empty_child_session_ids, &list, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto backups = ReadDir(std::string(kApexBackupDir),
+                         [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(backups));
+  auto backup1 =
+      StringPrintf("%s/com.android.apex.test_package@1.apex", kApexBackupDir);
+  auto backup2 =
+      StringPrintf("%s/com.android.apex.test_package_2@1.apex", kApexBackupDir);
+  ASSERT_THAT(*backups, UnorderedElementsAre(backup1, backup2));
+}
+
+TEST_F(ApexServiceTest, BackupActivePackagesClearsPreviousBackup) {
+  PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"));
+  PrepareTestApexForInstall installer3(GetTestFile("apex.apexd_test_v2.apex"),
+                                       "/data/pkg_staging/session_43",
+                                       "staging_data_file");
+
+  if (!installer1.Prepare() || !installer2.Prepare() || !installer3.Prepare()) {
+    return;
+  }
+
+  // Make sure /data/apex/backups exists.
+  ASSERT_TRUE(IsOk(createDirIfNeeded(std::string(kApexBackupDir), 0700)));
+  // Create some bogus files in /data/apex/backups.
+  std::ofstream old_backup(StringPrintf("%s/file1", kApexBackupDir));
+  ASSERT_TRUE(old_backup.good());
+  old_backup.close();
+
+  bool ret = false;
+  std::vector<std::string> pkgs = {installer1.test_file, installer2.test_file};
+  ASSERT_TRUE(IsOk(service_->stagePackages(pkgs, &ret)));
+  ASSERT_TRUE(ret);
+
+  // Make sure that /data/apex/active has activated packages.
+  auto active_pkgs = ReadDir(std::string(kActiveApexPackagesDataDir),
+                             [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_pkgs));
+  ASSERT_THAT(*active_pkgs,
+              UnorderedElementsAre(installer1.test_installed_file,
+                                   installer2.test_installed_file));
+
+  ApexInfoList list;
+  std::vector<int> empty_child_session_ids;
+  ASSERT_TRUE(IsOk(
+      service_->submitStagedSession(43, empty_child_session_ids, &list, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto backups = ReadDir(std::string(kApexBackupDir),
+                         [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(backups));
+  auto backup1 =
+      StringPrintf("%s/com.android.apex.test_package@1.apex", kApexBackupDir);
+  auto backup2 =
+      StringPrintf("%s/com.android.apex.test_package_2@1.apex", kApexBackupDir);
+  ASSERT_THAT(*backups, UnorderedElementsAre(backup1, backup2));
+}
+
+TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"),
+                                      "/data/pkg_staging/session_41",
+                                      "staging_data_file");
+
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  // Make sure that /data/apex/active exists and is empty
+  ASSERT_TRUE(
+      IsOk(createDirIfNeeded(std::string(kActiveApexPackagesDataDir), 0750)));
+  auto active_pkgs = ReadDir(std::string(kActiveApexPackagesDataDir),
+                             [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_pkgs));
+  ASSERT_EQ(0u, active_pkgs->size());
+
+  ApexInfoList list;
+  std::vector<int> empty_child_session_ids;
+  bool ret = false;
+  ASSERT_TRUE(IsOk(
+      service_->submitStagedSession(41, empty_child_session_ids, &list, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto backups = ReadDir(std::string(kApexBackupDir),
+                         [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(backups));
+  ASSERT_EQ(0u, backups->size());
+}
+
+TEST_F(ApexServiceTest, ActivePackagesFolderDoesNotExist) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"),
+                                      "/data/pkg_staging/session_41",
+                                      "staging_data_file");
+
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  // Make sure that /data/apex/active does not exist
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::remove_all(fs::path(kActiveApexPackagesDataDir), ec);
+  ASSERT_FALSE(ec) << "Failed to delete " << kActiveApexPackagesDataDir;
+
+  ApexInfoList list;
+  std::vector<int> empty_child_session_ids;
+  bool ret = false;
+  ASSERT_TRUE(IsOk(
+      service_->submitStagedSession(41, empty_child_session_ids, &list, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto backups = ReadDir(std::string(kApexBackupDir),
+                         [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(backups));
+  ASSERT_EQ(0u, backups->size());
+}
+
+class ApexServiceRollbackTest : public ApexServiceTest {
+ protected:
+  void SetUp() override { ApexServiceTest::SetUp(); }
+
+  void PrepareBackup(const std::vector<std::string> pkgs) {
+    ASSERT_TRUE(IsOk(createDirIfNeeded(std::string(kApexBackupDir), 0700)));
+    for (const auto& pkg : pkgs) {
+      PrepareTestApexForInstall installer(pkg);
+      ASSERT_TRUE(installer.Prepare()) << " failed to prepare " << pkg;
+      const std::string& from = installer.test_file;
+      std::string to = std::string(kApexBackupDir) + "/" + installer.package +
+                       "@" + std::to_string(installer.version) + ".apex";
+      std::error_code ec;
+      fs::copy(fs::path(from), fs::path(to),
+               fs::copy_options::create_hard_links, ec);
+      ASSERT_FALSE(ec) << "Failed to copy " << from << " to " << to << " : "
+                       << ec;
+    }
+  }
+
+  void CheckRollbackWasPerformed(
+      const std::vector<std::string>& expected_pkgs) {
+    // First check that /data/apex/active exists and has correct permissions.
+    struct stat sd;
+    ASSERT_EQ(0, stat(kActiveApexPackagesDataDir, &sd));
+    ASSERT_EQ(0750u, sd.st_mode & ALLPERMS);
+
+    // Now read content and check it contains expected values.
+    auto active_pkgs = ReadDir(std::string(kActiveApexPackagesDataDir),
+                               [](auto _, auto __) { return true; });
+    ASSERT_TRUE(IsOk(active_pkgs));
+    ASSERT_THAT(*active_pkgs, UnorderedElementsAreArray(expected_pkgs));
+  }
+};
+
+TEST_F(ApexServiceRollbackTest, AbortActiveSessionSuccessfulRollback) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  auto session = ApexSession::CreateSession(239);
+  ASSERT_TRUE(IsOk(session));
+  ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(SessionState::ACTIVATED)));
+
+  // Make sure /data/apex/active is non-empty.
+  bool ret;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &ret)));
+  ASSERT_TRUE(ret);
+
+  PrepareBackup({GetTestFile("apex.apexd_test.apex"),
+                 GetTestFile("apex.apexd_test_different_app.apex")});
+
+  ASSERT_TRUE(IsOk(service_->abortActiveSession()));
+
+  auto pkg1 = StringPrintf("%s/com.android.apex.test_package@1.apex",
+                           kActiveApexPackagesDataDir);
+  auto pkg2 = StringPrintf("%s/com.android.apex.test_package_2@1.apex",
+                           kActiveApexPackagesDataDir);
+  SCOPED_TRACE("");
+  CheckRollbackWasPerformed({pkg1, pkg2});
+
+  std::vector<ApexSessionInfo> sessions;
+  ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
+  ApexSessionInfo expected = CreateSessionInfo(239);
+  expected.isRolledBack = true;
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected)));
+}
+
+TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledSuccessfulRollback) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  auto session = ApexSession::CreateSession(1543);
+  ASSERT_TRUE(IsOk(session));
+  ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(SessionState::ACTIVATED)));
+
+  // Make sure /data/apex/active is non-empty.
+  bool ret;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &ret)));
+  ASSERT_TRUE(ret);
+
+  PrepareBackup({GetTestFile("apex.apexd_test.apex")});
+
+  ASSERT_TRUE(IsOk(rollbackLastSession()));
+
+  auto pkg = StringPrintf("%s/com.android.apex.test_package@1.apex",
+                          kActiveApexPackagesDataDir);
+  SCOPED_TRACE("");
+  CheckRollbackWasPerformed({pkg});
+}
+
+TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledNoActiveSession) {
+  // This test simulates a situation that should never happen on user builds:
+  // abortLastSession was called, but there are no active sessions.
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  // Make sure /data/apex/active is non-empty.
+  bool ret;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &ret)));
+  ASSERT_TRUE(ret);
+
+  PrepareBackup({GetTestFile("apex.apexd_test.apex")});
+
+  // Even though backup is there, no sessions are active, hence rollback request
+  // should fail.
+  ASSERT_FALSE(IsOk(rollbackLastSession()));
+}
+
+TEST_F(ApexServiceRollbackTest, RollbackFailsNoBackupFolder) {
+  ASSERT_FALSE(IsOk(rollbackLastSession()));
+}
+
+TEST_F(ApexServiceRollbackTest, RollbackFailsNoActivePackagesFolder) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
+  ASSERT_FALSE(IsOk(rollbackLastSession()));
+}
+
+TEST_F(ApexServiceRollbackTest, MarkStagedSessionSuccessfulCleanupBackup) {
+  PrepareBackup({GetTestFile("apex.apexd_test.apex"),
+                 GetTestFile("apex.apexd_test_different_app.apex")});
+
+  auto session = ApexSession::CreateSession(101);
+  ASSERT_TRUE(IsOk(session));
+  ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(SessionState::ACTIVATED)));
+
+  ASSERT_TRUE(IsOk(service_->markStagedSessionSuccessful(101)));
+
+  ASSERT_TRUE(fs::is_empty(fs::path(kApexBackupDir)));
+}
+
+TEST_F(ApexServiceRollbackTest, ResumesRollback) {
+  PrepareBackup({GetTestFile("apex.apexd_test.apex"),
+                 GetTestFile("apex.apexd_test_different_app.apex")});
+
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  // Make sure /data/apex/active is non-empty.
+  bool ret;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto session = ApexSession::CreateSession(17239);
+  ASSERT_TRUE(IsOk(session));
+  ASSERT_TRUE(
+      IsOk(session->UpdateStateAndCommit(SessionState::ROLLBACK_IN_PROGRESS)));
+
+  ASSERT_TRUE(IsOk(resumeRollbackIfNeeded()));
+
+  auto pkg1 = StringPrintf("%s/com.android.apex.test_package@1.apex",
+                           kActiveApexPackagesDataDir);
+  auto pkg2 = StringPrintf("%s/com.android.apex.test_package_2@1.apex",
+                           kActiveApexPackagesDataDir);
+  SCOPED_TRACE("");
+  CheckRollbackWasPerformed({pkg1, pkg2});
+
+  std::vector<ApexSessionInfo> sessions;
+  ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
+  ApexSessionInfo expected = CreateSessionInfo(17239);
+  expected.isRolledBack = true;
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected)));
+}
+
+TEST_F(ApexServiceRollbackTest, DoesNotResumeRollback) {
+  PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
+  if (!installer.Prepare()) {
+    return;
+  }
+
+  // Make sure /data/apex/active is non-empty.
+  bool ret;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &ret)));
+  ASSERT_TRUE(ret);
+
+  auto session = ApexSession::CreateSession(53);
+  ASSERT_TRUE(IsOk(session));
+  ASSERT_TRUE(IsOk(session->UpdateStateAndCommit(SessionState::SUCCESS)));
+
+  ASSERT_TRUE(IsOk(resumeRollbackIfNeeded()));
+
+  // Check that rollback wasn't resumed.
+  auto active_pkgs = ReadDir(std::string(kActiveApexPackagesDataDir),
+                             [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_pkgs));
+  ASSERT_THAT(*active_pkgs,
+              UnorderedElementsAre(installer.test_installed_file));
+
+  std::vector<ApexSessionInfo> sessions;
+  ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
+  ApexSessionInfo expected = CreateSessionInfo(53);
+  expected.isSuccess = true;
+  ASSERT_THAT(sessions, UnorderedElementsAre(SessionInfoEq(expected)));
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
