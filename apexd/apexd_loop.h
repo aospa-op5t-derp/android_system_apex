@@ -58,13 +58,15 @@ struct LoopbackDeviceUniqueFd {
 
 Status configureReadAhead(const std::string& device_path);
 
+Status preAllocateLoopDevices(int num);
+
 StatusOr<LoopbackDeviceUniqueFd> createLoopDevice(const std::string& target,
                                                   const int32_t imageOffset,
                                                   const size_t imageSize);
 
 using DestroyLoopFn =
     std::function<void(const std::string&, const std::string&)>;
-void DestroyLoopDevice(const std::string& path, DestroyLoopFn extra);
+void DestroyLoopDevice(const std::string& path, const DestroyLoopFn& extra);
 
 void destroyAllLoopDevices();
 

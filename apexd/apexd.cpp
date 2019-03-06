@@ -24,6 +24,7 @@
 #include "apex_manifest.h"
 #include "apexd_loop.h"
 #include "apexd_prepostinstall.h"
+#include "apexd_prop.h"
 #include "apexd_session.h"
 #include "apexd_utils.h"
 #include "status_or.h"
@@ -133,14 +134,14 @@ class DmVerityDevice {
   DmVerityDevice(const std::string& name, const std::string& dev_path)
       : name_(name), dev_path_(dev_path), cleared_(false) {}
 
-  DmVerityDevice(DmVerityDevice&& other)
-      : name_(other.name_),
-        dev_path_(other.dev_path_),
+  DmVerityDevice(DmVerityDevice&& other) noexcept
+      : name_(std::move(other.name_)),
+        dev_path_(std::move(other.dev_path_)),
         cleared_(other.cleared_) {
     other.cleared_ = true;
   }
 
-  DmVerityDevice& operator=(DmVerityDevice&& other) {
+  DmVerityDevice& operator=(DmVerityDevice&& other) noexcept {
     name_ = other.name_;
     dev_path_ = other.dev_path_;
     cleared_ = other.cleared_;
@@ -493,6 +494,35 @@ StatusOr<ApexFile> verifySessionDir(const int session_id) {
   return StatusOr<ApexFile>(std::move((*verified)[0]));
 }
 
+Status AbortNonFinalizedSessions() {
+  auto sessions = ApexSession::GetSessions();
+  int cnt = 0;
+  for (ApexSession& session : sessions) {
+    Status status;
+    switch (session.GetState()) {
+      case SessionState::VERIFIED:
+        [[clang::fallthrough]];
+      case SessionState::STAGED:
+        cnt++;
+        status = session.DeleteSession();
+        if (!status.Ok()) {
+          return Status::Fail(status.ErrorMessage());
+        }
+        if (cnt > 1) {
+          LOG(WARNING) << "More than one non-finalized session!";
+        }
+        break;
+      // TODO(b/124215327): fail if session is in ACTIVATED state.
+      default:
+        break;
+    }
+  }
+  if (cnt > 0) {
+    LOG(DEBUG) << "Aborted " << cnt << " non-finalized sessions";
+  }
+  return Status::Success();
+}
+
 }  // namespace
 
 namespace apexd_private {
@@ -594,6 +624,16 @@ std::string GetActiveMountPoint(const ApexManifest& manifest) {
 }
 
 }  // namespace apexd_private
+
+void startBootSequence() {
+  unmountAndDetachExistingImages();
+  scanStagedSessionsDirAndStage();
+  // Scan the directory under /data first, as it may contain updates of APEX
+  // packages living in the directory under /system, and we want the former ones
+  // to be used over the latter ones.
+  scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
+  scanPackagesDirAndActivate(kApexPackageSystemDir);
+}
 
 Status activatePackage(const std::string& full_path) {
   LOG(INFO) << "Trying to activate " << full_path;
@@ -709,6 +749,30 @@ StatusOr<ApexFile> getActivePackage(const std::string& packageName) {
       PStringLog() << "Cannot find matching package for: " << packageName);
 }
 
+Status abortActiveSession() {
+  auto session_or_none = ApexSession::GetActiveSession();
+  if (!session_or_none.Ok()) {
+    return session_or_none.ErrorStatus();
+  }
+  if (session_or_none->has_value()) {
+    const auto& session = session_or_none->value();
+    LOG(DEBUG) << "Aborting active session " << session;
+    switch (session.GetState()) {
+      case SessionState::VERIFIED:
+        [[clang::fallthrough]];
+      case SessionState::STAGED:
+        return session.DeleteSession();
+      // TODO(b/123622800): if state is ACTIVATED do a rollback.
+      default:
+        return Status::Fail(StringLog()
+                            << "Session " << session << " can't be aborted");
+    }
+  } else {
+    LOG(DEBUG) << "There are no active sessions";
+    return Status::Success();
+  }
+}
+
 void unmountAndDetachExistingImages() {
   // TODO: this procedure should probably not be needed anymore when apexd
   // becomes an actual daemon. Remove if that's the case.
@@ -798,7 +862,7 @@ void scanStagedSessionsDirAndStage() {
 
     std::vector<std::string> apexes;
     bool scanSuccessful = true;
-    for (auto dirToScan : dirsToScan) {
+    for (const auto& dirToScan : dirsToScan) {
       StatusOr<std::vector<std::string>> scan =
           FindApexFilesByName(dirToScan, /* include_dirs=*/false);
       if (!scan.Ok()) {
@@ -836,7 +900,7 @@ void scanStagedSessionsDirAndStage() {
       continue;
     }
 
-    const Status result = stagePackages(apexes, /* linkPackages */ true);
+    const Status result = stagePackages(apexes);
     if (!result.Ok()) {
       LOG(ERROR) << "Activation failed for packages " << Join(apexes, ',')
                  << ": " << result.ErrorMessage();
@@ -866,8 +930,7 @@ Status postinstallPackages(const std::vector<std::string>& paths) {
   return HandlePackages<Status>(paths, PostinstallPackages);
 }
 
-Status stagePackages(const std::vector<std::string>& tmpPaths,
-                     bool linkPackages) {
+Status stagePackages(const std::vector<std::string>& tmpPaths) {
   if (tmpPaths.empty()) {
     return Status::Fail("Empty set of inputs");
   }
@@ -916,32 +979,21 @@ Status stagePackages(const std::vector<std::string>& tmpPaths,
     }
     std::string dest_path = path_fn(*apex_file);
 
-    if (linkPackages) {
-      if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-        // TODO: Get correct binder error status.
-        return Status::Fail(PStringLog()
-                            << "Unable to link " << apex_file->GetPath()
-                            << " to " << dest_path);
+    if (access(dest_path.c_str(), F_OK) == 0) {
+      LOG(DEBUG) << dest_path << " already exists. Unlinking it";
+      if (unlink(dest_path.c_str()) != 0) {
+        return Status::Fail(PStringLog() << "Failed to unlink " << dest_path);
       }
-    } else {
-      if (rename(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
-        // TODO: Get correct binder error status.
-        return Status::Fail(PStringLog()
-                            << "Unable to rename " << apex_file->GetPath()
-                            << " to " << dest_path);
-      }
+    }
+    if (link(apex_file->GetPath().c_str(), dest_path.c_str()) != 0) {
+      // TODO: Get correct binder error status.
+      return Status::Fail(PStringLog()
+                          << "Unable to link " << apex_file->GetPath() << " to "
+                          << dest_path);
     }
     staged_files.insert(dest_path);
     staged_packages.insert(apex_file->GetManifest().name());
 
-    if (!linkPackages) {
-      // TODO(b/112669193,b/118865310) remove this. Link files from staging
-      // directory should be the only method allowed.
-      if (selinux_android_restorecon(dest_path.c_str(), 0) < 0) {
-        return Status::Fail(PStringLog()
-                            << "Failed to restorecon " << dest_path);
-      }
-    }
     LOG(DEBUG) << "Success linking " << apex_file->GetPath() << " to "
                << dest_path;
   }
@@ -963,6 +1015,20 @@ void onStart() {
     PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
                 << kApexStatusStarting;
   }
+
+  // Scan /system/apex to get the number of (non-flattened) APEXes and
+  // pre-allocated loopback devices so that we don't have to wait for it
+  // later when actually activating APEXes.
+  StatusOr<std::vector<std::string>> scan =
+      FindApexFilesByName(kApexPackageSystemDir, false /*include_dirs*/);
+  if (!scan.Ok()) {
+    LOG(WARNING) << scan.ErrorMessage();
+  } else if (scan->size() > 0) {
+    Status preAllocStatus = loop::preAllocateLoopDevices(scan->size());
+    if (!preAllocStatus.Ok()) {
+      LOG(ERROR) << preAllocStatus.ErrorMessage();
+    }
+  }
 }
 
 void onAllPackagesReady() {
@@ -980,6 +1046,11 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  Status cleanup_status = AbortNonFinalizedSessions();
+  if (!cleanup_status.Ok()) {
+    return StatusOr<std::vector<ApexFile>>::MakeError(cleanup_status);
+  }
+
   std::vector<int> ids_to_scan;
   if (!child_session_ids.empty()) {
     ids_to_scan = child_session_ids;
@@ -1033,6 +1104,26 @@ Status markStagedSessionReady(const int session_id) {
   }
   return Status::Fail(StringLog() << "Invalid state for session " << session_id
                                   << ". Cannot mark it as ready.");
+}
+
+Status markStagedSessionSuccessful(const int session_id) {
+  auto session = ApexSession::GetSession(session_id);
+  if (!session.Ok()) {
+    return session.ErrorStatus();
+  }
+  // Only SessionState::ACTIVATED or SessionState::SUCCESS states are accepted.
+  // In the SessionState::SUCCESS state, this function is a no-op.
+  switch (session->GetState()) {
+    case SessionState::SUCCESS:
+      return Status::Success();
+    case SessionState::ACTIVATED:
+      // TODO(b/123622800): also cleanup a backup.
+      // TODO(b/124215327): maybe crash system_server if state update fails.
+      return session->UpdateStateAndCommit(SessionState::SUCCESS);
+    default:
+      return Status::Fail(StringLog() << "Session " << *session
+                                      << " can not be marked successful");
+  }
 }
 
 }  // namespace apex

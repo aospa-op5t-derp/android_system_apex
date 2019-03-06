@@ -46,7 +46,10 @@ java_test_host {
 
     libs: ["tradefed"],
 
-    static_libs: ["apex_e2e_base_test"],
+    static_libs: [
+        "apex_e2e_base_test",
+        "platformprotos",
+    ],
 
     data: [
         ":test1_com.android.tzdata",
@@ -91,6 +94,7 @@ apex {
     name: "apex_test_build_features",
     file_contexts: "apex.test",
     manifest: "testdata/apex_manifest.json",
+    androidManifest: "testdata/AndroidManifest.xml",
     binaries: ["surfaceflinger", "vold"],
     multilib: {
         prefer32: {
