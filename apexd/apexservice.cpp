@@ -75,6 +75,7 @@ class ApexService : public BnApexService {
       const std::vector<std::string>& paths) override;
   BinderStatus postinstallPackages(
       const std::vector<std::string>& paths) override;
+  BinderStatus abortActiveSession() override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -339,6 +340,11 @@ BinderStatus ApexService::postinstallPackages(
                                          String8(res.ErrorMessage().c_str()));
 }
 
+BinderStatus ApexService::abortActiveSession() {
+  // TODO: Implement.
+  return BinderStatus::ok();
+}
+
 status_t ApexService::onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
                                  Parcel* _aidl_reply, uint32_t _aidl_flags) {
   switch (_aidl_code) {
@@ -369,10 +375,15 @@ status_t ApexService::onTransact(uint32_t _aidl_code, const Parcel& _aidl_data,
                                    _aidl_flags);
 }
 status_t ApexService::dump(int fd, const Vector<String16>& args) {
-  // TODO: Extend to add session info
   std::vector<ApexInfo> list;
   BinderStatus status = getActivePackages(&list);
-  if (status.isOk()) {
+  dprintf(fd, "ACTIVE PACKAGES:\n");
+  if (!status.isOk()) {
+    std::string msg = StringLog() << "Failed to retrieve packages: "
+                                  << status.toString8().string() << std::endl;
+    dprintf(fd, "%s", msg.c_str());
+    return BAD_VALUE;
+  } else {
     for (const auto& item : list) {
       std::string msg = StringLog()
                         << "Package: " << item.packageName
@@ -380,12 +391,28 @@ status_t ApexService::dump(int fd, const Vector<String16>& args) {
                         << " Path: " << item.packagePath << std::endl;
       dprintf(fd, "%s", msg.c_str());
     }
-    return OK;
   }
-  std::string msg = StringLog() << "Failed to retrieve packages: "
-                                << status.toString8().string() << std::endl;
-  dprintf(fd, "%s", msg.c_str());
-  return BAD_VALUE;
+
+  dprintf(fd, "SESSIONS:\n");
+  std::vector<ApexSession> sessions = ApexSession::GetSessions();
+
+  for (const auto& session : sessions) {
+    std::string child_ids_str = "";
+    auto child_ids = session.GetChildSessionIds();
+    if (child_ids.size() > 0) {
+      child_ids_str = "Child IDs:";
+      for (auto childSessionId : session.GetChildSessionIds()) {
+        child_ids_str += " " + std::to_string(childSessionId);
+      }
+    }
+    std::string msg =
+        StringLog() << "Session ID: " << session.GetId() << child_ids_str
+                    << " State: " << SessionState_State_Name(session.GetState())
+                    << std::endl;
+    dprintf(fd, "%s", msg.c_str());
+  }
+
+  return OK;
 }
 
 status_t ApexService::shellCommand(int in, int out, int err,
@@ -415,6 +442,12 @@ status_t ApexService::shellCommand(int in, int out, int err,
         << std::endl
         << "  deactivatePackage [packagePath] - deactivate package from the "
            "given path"
+        << std::endl
+        << "  preinstallPackages [packagePath1] ([packagePath2]...) - run "
+           "pre-install hooks of the given packages"
+        << std::endl
+        << "  postinstallPackages [packagePath1] ([packagePath2]...) - run "
+           "post-install hooks of the given packages"
         << std::endl
         << "  getStagedSessionInfo [sessionId] - displays information about a "
            "given session previously submitted"
@@ -603,6 +636,31 @@ status_t ApexService::shellCommand(int in, int out, int err,
       return OK;
     }
     std::string msg = StringLog() << "Failed to submit session: "
+                                  << status.toString8().string() << std::endl;
+    dprintf(err, "%s", msg.c_str());
+    return BAD_VALUE;
+  }
+
+  if (cmd == String16("preinstallPackages") ||
+      cmd == String16("postinstallPackages")) {
+    if (args.size() < 2) {
+      print_help(err,
+                 "preinstallPackages/postinstallPackages requires at least"
+                 " one packagePath");
+      return BAD_VALUE;
+    }
+    std::vector<std::string> pkgs;
+    pkgs.reserve(args.size() - 1);
+    for (size_t i = 1; i != args.size(); ++i) {
+      pkgs.emplace_back(String8(args[i]).string());
+    }
+    BinderStatus status = cmd == String16("preinstallPackages")
+                              ? preinstallPackages(pkgs)
+                              : postinstallPackages(pkgs);
+    if (status.isOk()) {
+      return OK;
+    }
+    std::string msg = StringLog() << "Failed to pre/postinstall package(s): "
                                   << status.toString8().string() << std::endl;
     dprintf(err, "%s", msg.c_str());
     return BAD_VALUE;
