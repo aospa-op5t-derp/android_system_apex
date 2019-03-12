@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+#include <android/apex/ApexSessionInfo.h>
 #include <binder/IServiceManager.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
 
 #include "status.h"
 
@@ -52,6 +55,60 @@ inline ::testing::AssertionResult IsOk(const android::binder::Status& status) {
   }
 }
 
+MATCHER_P(SessionInfoEq, other, "") {
+  using ::testing::AllOf;
+  using ::testing::Eq;
+  using ::testing::ExplainMatchResult;
+  using ::testing::Field;
+
+  return ExplainMatchResult(
+      AllOf(
+          Field("sessionId", &ApexSessionInfo::sessionId, Eq(other.sessionId)),
+          Field("isUnknown", &ApexSessionInfo::isUnknown, Eq(other.isUnknown)),
+          Field("isVerified", &ApexSessionInfo::isVerified,
+                Eq(other.isVerified)),
+          Field("isStaged", &ApexSessionInfo::isStaged, Eq(other.isStaged)),
+          Field("isActivated", &ApexSessionInfo::isActivated,
+                Eq(other.isActivated)),
+          Field("isRollbackInProgress", &ApexSessionInfo::isRollbackInProgress,
+                Eq(other.isRollbackInProgress)),
+          Field("isActivationFailed", &ApexSessionInfo::isActivationFailed,
+                Eq(other.isActivationFailed)),
+          Field("isSuccess", &ApexSessionInfo::isSuccess, Eq(other.isSuccess)),
+          Field("isRolledBack", &ApexSessionInfo::isRolledBack,
+                Eq(other.isRolledBack))),
+      arg, result_listener);
+}
+
+inline ApexSessionInfo CreateSessionInfo(int session_id) {
+  ApexSessionInfo info;
+  info.sessionId = session_id;
+  info.isUnknown = false;
+  info.isVerified = false;
+  info.isStaged = false;
+  info.isActivated = false;
+  info.isRollbackInProgress = false;
+  info.isActivationFailed = false;
+  info.isSuccess = false;
+  info.isRolledBack = false;
+  return info;
+}
+
 }  // namespace testing
+
+// Must be in apex::android namespace, otherwise gtest won't be able to find it.
+inline void PrintTo(const ApexSessionInfo& session, std::ostream* os) {
+  *os << "apex_session: {\n";
+  *os << "  sessionId : " << session.sessionId << "\n";
+  *os << "  isUnknown : " << session.isUnknown << "\n";
+  *os << "  isVerified : " << session.isVerified << "\n";
+  *os << "  isStaged : " << session.isStaged << "\n";
+  *os << "  isActivated : " << session.isActivated << "\n";
+  *os << "  isActivationFailed : " << session.isActivationFailed << "\n";
+  *os << "  isSuccess : " << session.isSuccess << "\n";
+  *os << "  isRolledBack : " << session.isRolledBack << "\n";
+  *os << "}";
+}
+
 }  // namespace apex
 }  // namespace android
