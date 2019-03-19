@@ -17,6 +17,7 @@
 #ifndef ANDROID_APEXD_APEXD_UTILS_H_
 #define ANDROID_APEXD_APEXD_UTILS_H_
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include <sys/wait.h>
 
 #include <android-base/logging.h>
+#include <cutils/android_reboot.h>
 
 #include "string_log.h"
 
@@ -125,6 +127,42 @@ inline Status createDirIfNeeded(const std::string& path, mode_t mode) {
   }
 
   return Status::Success();
+}
+
+inline Status DeleteDirContent(const std::string& path) {
+  auto files = ReadDir(path, [](auto _, auto __) { return true; });
+  if (!files.Ok()) {
+    return Status::Fail(StringLog() << "Failed to delete " << path << " : "
+                                    << files.ErrorMessage());
+  }
+  for (const std::string& file : *files) {
+    if (unlink(file.c_str()) != 0) {
+      return Status::Fail(PStringLog() << "Failed to delete " << file);
+    }
+  }
+  return Status::Success();
+}
+
+inline StatusOr<bool> PathExists(const std::string& path) {
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  if (!fs::exists(fs::path(path), ec)) {
+    if (ec) {
+      return StatusOr<bool>::MakeError(StringLog() << "Failed to access "
+                                                   << path << " : " << ec);
+    } else {
+      return StatusOr<bool>(false);
+    }
+  }
+  return StatusOr<bool>(true);
+}
+
+inline void Reboot() {
+  LOG(INFO) << "Rebooting device";
+  if (android_reboot(ANDROID_RB_RESTART2, 0, nullptr) != 0) {
+    LOG(ERROR) << "Failed to reboot device";
+  }
 }
 
 }  // namespace apex

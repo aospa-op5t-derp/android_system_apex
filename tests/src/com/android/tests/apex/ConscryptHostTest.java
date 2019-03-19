@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@
 
 package com.android.tests.apex;
 
+import static org.junit.Assert.assertTrue;
+
 import com.android.tradefed.device.DeviceNotAvailableException;
-import com.android.tradefed.log.LogUtil.CLog;
+import com.android.tradefed.device.IManagedTestDevice;
 import com.android.tradefed.testtype.DeviceJUnit4ClassRunner;
 
 import org.junit.Test;
@@ -29,7 +31,7 @@ import java.io.IOException;
  * Test to check if Apex can be staged, activated and uninstalled successfully.
  */
 @RunWith(DeviceJUnit4ClassRunner.class)
-public class ApexPackageStageActivateUninstallHostTest extends ApexE2EBaseHostTest {
+public class ConscryptHostTest extends ApexE2EBaseHostTest {
 
     /**
      * Tests that if Apex package can be staged, activated and uninstalled successfully.
@@ -40,15 +42,8 @@ public class ApexPackageStageActivateUninstallHostTest extends ApexE2EBaseHostTe
         doTestStageActivateUninstallApexPackage();
     }
 
-    @Test
-    public void testStageActivatUninstallTwice() throws Exception {
-        doTestStageActivateUninstallApexPackage();
-        CLog.i("Installing the same apex second time");
-        doTestStageActivateUninstallApexPackage();
-    }
-
     @Override
     public void additionalCheck() {
-      // Nothing to do here.
+        assertTrue(((IManagedTestDevice) getDevice()).getMonitor().waitForBootComplete(60000));
     }
 }

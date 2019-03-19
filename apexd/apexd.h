@@ -31,25 +31,30 @@ namespace apex {
 
 static constexpr const char* kApexDataDir = "/data/apex";
 static constexpr const char* kActiveApexPackagesDataDir = "/data/apex/active";
+static constexpr const char* kApexBackupDir = "/data/apex/backup";
 static constexpr const char* kApexPackageSystemDir = "/system/apex";
 static constexpr const char* kApexRoot = "/apex";
-static constexpr const char* kStagedSessionsDir = "/data/staging";
+static constexpr const char* kStagedSessionsDir = "/data/pkg_staging";
+
+Status resumeRollbackIfNeeded();
+
+void startBootSequence();
 
 void unmountAndDetachExistingImages();
 
-void scanPackagesDirAndActivate(const char* apex_package_dir);
+Status scanPackagesDirAndActivate(const char* apex_package_dir);
 void scanStagedSessionsDirAndStage();
 
 Status preinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;
 Status postinstallPackages(const std::vector<std::string>& paths) WARN_UNUSED;
 
-Status stagePackages(const std::vector<std::string>& tmpPaths,
-                     bool linkPackages = false) WARN_UNUSED;
+Status stagePackages(const std::vector<std::string>& tmpPaths) WARN_UNUSED;
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id,
     const std::vector<int>& child_session_ids) WARN_UNUSED;
 Status markStagedSessionReady(const int session_id) WARN_UNUSED;
+Status markStagedSessionSuccessful(const int session_id) WARN_UNUSED;
 Status rollbackLastSession();
 
 Status activatePackage(const std::string& full_path) WARN_UNUSED;
@@ -57,6 +62,8 @@ Status deactivatePackage(const std::string& full_path) WARN_UNUSED;
 
 std::vector<ApexFile> getActivePackages();
 StatusOr<ApexFile> getActivePackage(const std::string& package_name);
+
+Status abortActiveSession();
 
 void onStart();
 void onAllPackagesReady();
