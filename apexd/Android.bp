@@ -32,6 +32,7 @@ cc_defaults {
   defaults: ["apex_flags_defaults"],
   shared_libs: [
     "libbase",
+    "libcrypto",
     "libjsoncpp",
     "libprotobuf-cpp-full",
     "libziparchive",
@@ -61,6 +62,9 @@ aidl_interface {
   ],
   local_include_dir: "aidl",
   backend: {
+      java: {
+          sdk_version: "28",
+      },
       ndk: {
           enabled: false,
       },
@@ -82,6 +86,7 @@ cc_binary {
     "libapexservice",
     "libavb",
     "libdm",
+    "libvold_binder",
   ],
   shared_libs: [
     "libselinux",
@@ -113,6 +118,7 @@ cc_library_static {
     "libapex",
     "libavb",
     "libdm",
+    "libvold_binder",
   ],
   shared_libs: [
     "libselinux",
@@ -144,6 +150,7 @@ cc_library_static {
   srcs: [
     "apex_file.cpp",
     "apex_manifest.cpp",
+    "apex_shim.cpp",
   ],
   static_libs: ["libavb"],
   host_supported: true,
@@ -254,6 +261,8 @@ cc_test {
     ":apex.apexd_test_postinstall",
     ":apex.apexd_test_prepostinstall.fail",
     ":gen_bad_apexes",
+    ":com.android.apex.cts.shim.v2",
+    ":com.android.apex.cts.shim.v1",
   ],
   srcs: ["apexservice_test.cpp"],
   host_supported: false,
@@ -264,6 +273,7 @@ cc_test {
     "libapexd",
     "libavb",
     "libgmock",
+    "libvold_binder",
   ],
   shared_libs: [
     "libbinder",
@@ -272,4 +282,19 @@ cc_test {
   ],
   test_suites: ["device-tests"],
   test_config: "apexservice_test_config.xml",
+}
+
+cc_test {
+  name: "apex_shim_test",
+  defaults: ["apex_defaults"],
+  data: [":apex.apexd_test"],
+  srcs: ["apex_shim_test.cpp"],
+  host_supported: true,
+  target: {
+    darwin: {
+      enabled: false,
+    },
+  },
+  static_libs: ["libapex"],
+  test_suites: ["device-tests"],
 }
