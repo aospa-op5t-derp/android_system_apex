@@ -17,8 +17,10 @@
 #ifndef ANDROID_APEXD_APEXD_UTILS_H_
 #define ANDROID_APEXD_APEXD_UTILS_H_
 
+#include <chrono>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dirent.h>
@@ -26,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <cutils/android_reboot.h>
 
@@ -103,6 +106,11 @@ StatusOr<std::vector<std::string>> ReadDir(const std::string& path,
   return StatusOr<std::vector<std::string>>(std::move(ret));
 }
 
+inline bool IsEmptyDirectory(const std::string& path) {
+  auto res = ReadDir(path, [](auto _, auto __) { return true; });
+  return res.Ok() && res->empty();
+}
+
 inline Status createDirIfNeeded(const std::string& path, mode_t mode) {
   struct stat stat_data;
 
@@ -163,6 +171,25 @@ inline void Reboot() {
   if (android_reboot(ANDROID_RB_RESTART2, 0, nullptr) != 0) {
     LOG(ERROR) << "Failed to reboot device";
   }
+}
+
+inline Status WaitForFile(const std::string& path,
+                          std::chrono::nanoseconds timeout) {
+  android::base::Timer t;
+  bool has_slept = false;
+  while (t.duration() < timeout) {
+    struct stat sb;
+    if (stat(path.c_str(), &sb) != -1) {
+      if (has_slept) {
+        LOG(INFO) << "wait for '" << path << "' took " << t;
+      }
+      return Status::Success();
+    }
+    std::this_thread::sleep_for(5ms);
+    has_slept = true;
+  }
+  return Status::Fail(PStringLog()
+                      << "wait for '" << path << "' timed out and took " << t);
 }
 
 }  // namespace apex
