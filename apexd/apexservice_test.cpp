@@ -35,6 +35,7 @@
 #include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android/os/IVold.h>
 #include <binder/IServiceManager.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -82,11 +83,19 @@ class ApexServiceTest : public ::testing::Test {
     if (binder != nullptr) {
       service_ = android::interface_cast<IApexService>(binder);
     }
+    binder = sm->getService(String16("vold"));
+    if (binder != nullptr) {
+      vold_service_ = android::interface_cast<android::os::IVold>(binder);
+    }
   }
 
  protected:
   void SetUp() override {
     ASSERT_NE(nullptr, service_.get());
+    ASSERT_NE(nullptr, vold_service_.get());
+    android::binder::Status status =
+        vold_service_->supportsCheckpoint(&supports_fs_checkpointing_);
+    ASSERT_TRUE(IsOk(status));
     CleanUp();
   }
 
@@ -209,7 +218,7 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   struct PrepareTestApexForInstall {
-    static constexpr const char* kTestDir = "/data/pkg_staging/apexservice_tmp";
+    static constexpr const char* kTestDir = "/data/app-staging/apexservice_tmp";
 
     // This is given to the constructor.
     std::string test_input;  // Original test file.
@@ -339,6 +348,8 @@ class ApexServiceTest : public ::testing::Test {
   }
 
   sp<IApexService> service_;
+  sp<android::os::IVold> vold_service_;
+  bool supports_fs_checkpointing_;
 
  private:
   void CleanUp() {
@@ -439,7 +450,7 @@ TEST_F(ApexServiceTest, StageFailKey) {
 
   constexpr const char* kExpectedError3 =
       "Error verifying "
-      "/data/pkg_staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
+      "/data/app-staging/apexservice_tmp/apex.apexd_test_no_inst_key.apex: "
       "couldn't verify public key: Failed to compare the bundled public key "
       "with key";
   const size_t pos3 = error.find(kExpectedError3);
@@ -485,7 +496,7 @@ TEST_F(ApexServiceTest, StageSuccess_ClearsPreviouslyActivePackage) {
   EXPECT_TRUE(RegularFileExists(installer3.test_installed_file));
 }
 
-TEST_F(ApexServiceTest, StageAlreadyActivePackageSuccess) {
+TEST_F(ApexServiceTest, StageAlreadyStagedPackageSuccess) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
   if (!installer.Prepare()) {
     return;
@@ -700,6 +711,15 @@ TEST_F(ApexServiceActivationSuccessTest, GetActivePackage) {
   ASSERT_EQ(installer_->test_installed_file, active->packagePath);
 }
 
+TEST_F(ApexServiceActivationSuccessTest, StageAlreadyActivePackageSameVersion) {
+  ASSERT_TRUE(IsOk(service_->activatePackage(installer_->test_installed_file)))
+      << GetDebugStr(installer_.get());
+
+  bool success = false;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer_->test_file, &success)));
+  ASSERT_TRUE(success);
+}
+
 class ApexServicePrePostInstallTest : public ApexServiceTest {
  public:
   template <typename Fn>
@@ -791,7 +811,7 @@ TEST_F(ApexServicePrePostInstallTest, PostinstallFail) {
 
 TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/pkg_staging/session_123",
+                                      "/data/app-staging/session_123",
                                       "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
@@ -852,7 +872,7 @@ TEST_F(ApexServiceTest, SubmitSingleSessionTestSuccess) {
 
 TEST_F(ApexServiceTest, SubmitSingleStagedSessionDeletesPreviousSessions) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/pkg_staging/session_239",
+                                      "/data/app-staging/session_239",
                                       "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
@@ -900,7 +920,7 @@ TEST_F(ApexServiceTest, SubmitSingleStagedSessionDeletesPreviousSessions) {
 TEST_F(ApexServiceTest, SubmitSingleSessionTestFail) {
   PrepareTestApexForInstall installer(
       GetTestFile("apex.apexd_test_no_inst_key.apex"),
-      "/data/pkg_staging/session_456", "staging_data_file");
+      "/data/app-staging/session_456", "staging_data_file");
   if (!installer.Prepare()) {
     FAIL() << GetDebugStr(&installer);
   }
@@ -925,11 +945,11 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestSuccess) {
   // Parent session id: 10
   // Children session ids: 20 30
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/pkg_staging/session_20",
+                                      "/data/app-staging/session_20",
                                       "staging_data_file");
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"),
-      "/data/pkg_staging/session_30", "staging_data_file");
+      "/data/app-staging/session_30", "staging_data_file");
   if (!installer.Prepare() || !installer2.Prepare()) {
     FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
   }
@@ -986,11 +1006,11 @@ TEST_F(ApexServiceTest, SubmitMultiSessionTestFail) {
   // Parent session id: 11
   // Children session ids: 21 31
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"),
-                                      "/data/pkg_staging/session_21",
+                                      "/data/app-staging/session_21",
                                       "staging_data_file");
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_no_inst_key.apex"),
-      "/data/pkg_staging/session_31", "staging_data_file");
+      "/data/app-staging/session_31", "staging_data_file");
   if (!installer.Prepare() || !installer2.Prepare()) {
     FAIL() << GetDebugStr(&installer) << GetDebugStr(&installer2);
   }
@@ -1095,11 +1115,14 @@ TEST_F(ApexServiceTest, AbortActiveSession) {
 }
 
 TEST_F(ApexServiceTest, BackupActivePackages) {
+  if (supports_fs_checkpointing_) {
+    return;
+  }
   PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"));
   PrepareTestApexForInstall installer3(GetTestFile("apex.apexd_test_v2.apex"),
-                                       "/data/pkg_staging/session_23",
+                                       "/data/app-staging/session_23",
                                        "staging_data_file");
 
   if (!installer1.Prepare() || !installer2.Prepare() || !installer3.Prepare()) {
@@ -1137,11 +1160,14 @@ TEST_F(ApexServiceTest, BackupActivePackages) {
 }
 
 TEST_F(ApexServiceTest, BackupActivePackagesClearsPreviousBackup) {
+  if (supports_fs_checkpointing_) {
+    return;
+  }
   PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
   PrepareTestApexForInstall installer2(
       GetTestFile("apex.apexd_test_different_app.apex"));
   PrepareTestApexForInstall installer3(GetTestFile("apex.apexd_test_v2.apex"),
-                                       "/data/pkg_staging/session_43",
+                                       "/data/app-staging/session_43",
                                        "staging_data_file");
 
   if (!installer1.Prepare() || !installer2.Prepare() || !installer3.Prepare()) {
@@ -1185,8 +1211,11 @@ TEST_F(ApexServiceTest, BackupActivePackagesClearsPreviousBackup) {
 }
 
 TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
+  if (supports_fs_checkpointing_) {
+    return;
+  }
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"),
-                                      "/data/pkg_staging/session_41",
+                                      "/data/app-staging/session_41",
                                       "staging_data_file");
 
   if (!installer.Prepare()) {
@@ -1216,7 +1245,7 @@ TEST_F(ApexServiceTest, BackupActivePackagesZeroActivePackages) {
 
 TEST_F(ApexServiceTest, ActivePackagesFolderDoesNotExist) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"),
-                                      "/data/pkg_staging/session_41",
+                                      "/data/app-staging/session_41",
                                       "staging_data_file");
 
   if (!installer.Prepare()) {
@@ -1236,10 +1265,61 @@ TEST_F(ApexServiceTest, ActivePackagesFolderDoesNotExist) {
       service_->submitStagedSession(41, empty_child_session_ids, &list, &ret)));
   ASSERT_TRUE(ret);
 
-  auto backups = ReadDir(std::string(kApexBackupDir),
-                         [](auto _, auto __) { return true; });
-  ASSERT_TRUE(IsOk(backups));
-  ASSERT_EQ(0u, backups->size());
+  if (!supports_fs_checkpointing_) {
+    auto backups = ReadDir(std::string(kApexBackupDir),
+                           [](auto _, auto __) { return true; });
+    ASSERT_TRUE(IsOk(backups));
+    ASSERT_EQ(0u, backups->size());
+  }
+}
+
+TEST_F(ApexServiceTest, UnstagePackagesSuccess) {
+  PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"));
+
+  if (!installer1.Prepare() || !installer2.Prepare()) {
+    return;
+  }
+
+  bool ret = false;
+  std::vector<std::string> pkgs = {installer1.test_file, installer2.test_file};
+  ASSERT_TRUE(IsOk(service_->stagePackages(pkgs, &ret)));
+  ASSERT_TRUE(ret);
+
+  pkgs = {installer2.test_installed_file};
+  ASSERT_TRUE(IsOk(service_->unstagePackages(pkgs)));
+
+  auto active_packages = ReadDir(std::string(kActiveApexPackagesDataDir),
+                                 [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_packages));
+  ASSERT_THAT(*active_packages,
+              UnorderedElementsAre(installer1.test_installed_file));
+}
+
+TEST_F(ApexServiceTest, UnstagePackagesFail) {
+  PrepareTestApexForInstall installer1(GetTestFile("apex.apexd_test.apex"));
+  PrepareTestApexForInstall installer2(
+      GetTestFile("apex.apexd_test_different_app.apex"));
+
+  if (!installer1.Prepare() || !installer2.Prepare()) {
+    return;
+  }
+
+  bool ret = false;
+  std::vector<std::string> pkgs = {installer1.test_file};
+  ASSERT_TRUE(IsOk(service_->stagePackages(pkgs, &ret)));
+  ASSERT_TRUE(ret);
+
+  pkgs = {installer1.test_installed_file, installer2.test_installed_file};
+  ASSERT_FALSE(IsOk(service_->unstagePackages(pkgs)));
+
+  // Check that first package wasn't unstaged.
+  auto active_packages = ReadDir(std::string(kActiveApexPackagesDataDir),
+                                 [](auto _, auto __) { return true; });
+  ASSERT_TRUE(IsOk(active_packages));
+  ASSERT_THAT(*active_packages,
+              UnorderedElementsAre(installer1.test_installed_file));
 }
 
 class ApexServiceRollbackTest : public ApexServiceTest {
@@ -1278,6 +1358,10 @@ class ApexServiceRollbackTest : public ApexServiceTest {
 };
 
 TEST_F(ApexServiceRollbackTest, AbortActiveSessionSuccessfulRollback) {
+  if (supports_fs_checkpointing_) {
+    // Can't test rollback when using filesystem checkpointing
+    return;
+  }
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
   if (!installer.Prepare()) {
     return;
@@ -1303,7 +1387,6 @@ TEST_F(ApexServiceRollbackTest, AbortActiveSessionSuccessfulRollback) {
                            kActiveApexPackagesDataDir);
   SCOPED_TRACE("");
   CheckRollbackWasPerformed({pkg1, pkg2});
-
   std::vector<ApexSessionInfo> sessions;
   ASSERT_TRUE(IsOk(service_->getSessions(&sessions)));
   ApexSessionInfo expected = CreateSessionInfo(239);
@@ -1328,7 +1411,7 @@ TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledSuccessfulRollback) {
 
   PrepareBackup({GetTestFile("apex.apexd_test.apex")});
 
-  ASSERT_TRUE(IsOk(rollbackLastSession()));
+  ASSERT_TRUE(IsOk(rollbackActiveSession()));
 
   auto pkg = StringPrintf("%s/com.android.apex.test_package@1.apex",
                           kActiveApexPackagesDataDir);
@@ -1353,16 +1436,16 @@ TEST_F(ApexServiceRollbackTest, RollbackLastSessionCalledNoActiveSession) {
 
   // Even though backup is there, no sessions are active, hence rollback request
   // should fail.
-  ASSERT_FALSE(IsOk(rollbackLastSession()));
+  ASSERT_FALSE(IsOk(rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, RollbackFailsNoBackupFolder) {
-  ASSERT_FALSE(IsOk(rollbackLastSession()));
+  ASSERT_FALSE(IsOk(rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, RollbackFailsNoActivePackagesFolder) {
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test.apex"));
-  ASSERT_FALSE(IsOk(rollbackLastSession()));
+  ASSERT_FALSE(IsOk(rollbackActiveSession()));
 }
 
 TEST_F(ApexServiceRollbackTest, MarkStagedSessionSuccessfulCleanupBackup) {
@@ -1379,6 +1462,9 @@ TEST_F(ApexServiceRollbackTest, MarkStagedSessionSuccessfulCleanupBackup) {
 }
 
 TEST_F(ApexServiceRollbackTest, ResumesRollback) {
+  if (supports_fs_checkpointing_) {
+    return;
+  }
   PrepareBackup({GetTestFile("apex.apexd_test.apex"),
                  GetTestFile("apex.apexd_test_different_app.apex")});
 
@@ -1414,6 +1500,9 @@ TEST_F(ApexServiceRollbackTest, ResumesRollback) {
 }
 
 TEST_F(ApexServiceRollbackTest, DoesNotResumeRollback) {
+  if (supports_fs_checkpointing_) {
+    return;
+  }
   PrepareTestApexForInstall installer(GetTestFile("apex.apexd_test_v2.apex"));
   if (!installer.Prepare()) {
     return;
@@ -1577,6 +1666,44 @@ TEST(ApexdTest, ApexesAreActivatedForEarlyProcesses) {
       ASSERT_NE(mountpoints.end(), mountpoints.find(apex_name));
     }
   }
+}
+
+class ApexShimUpdateTest : public ApexServiceTest {
+ protected:
+  std::unique_ptr<PrepareTestApexForInstall> system_shim_;
+
+  void SetUp() override {
+    ApexServiceTest::SetUp();
+
+    // TODO: instead verify shim apex is pre-installed.
+    system_shim_ = std::make_unique<PrepareTestApexForInstall>(
+        GetTestFile("com.android.apex.cts.shim.v1.apex"));
+    if (!system_shim_->Prepare()) {
+      FAIL() << GetDebugStr(system_shim_.get());
+    }
+    // Putting system version into /data/apex/active won't work, because staging
+    // of a newer version will delete previous one from /data/apex/active,
+    // resulting in test not being to deactivate it on tear down.
+    ASSERT_TRUE(IsOk(service_->activatePackage(system_shim_->test_file)));
+  }
+
+  void TearDown() override {
+    ASSERT_TRUE(IsOk(service_->deactivatePackage(system_shim_->test_file)));
+    ApexServiceTest::TearDown();
+  }
+};
+
+TEST_F(ApexShimUpdateTest, UpdateToV2Success) {
+  PrepareTestApexForInstall installer(
+      GetTestFile("com.android.apex.cts.shim.v2.apex"));
+
+  if (!installer.Prepare()) {
+    FAIL() << GetDebugStr(&installer);
+  }
+
+  bool success;
+  ASSERT_TRUE(IsOk(service_->stagePackage(installer.test_file, &success)));
+  ASSERT_TRUE(success);
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
