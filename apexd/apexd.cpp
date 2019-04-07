@@ -103,6 +103,12 @@ MountedApexDatabase gMountedApexes;
 static constexpr size_t kLoopDeviceSetupAttempts = 3u;
 static constexpr size_t kMountAttempts = 5u;
 
+bool gBootstrap = false;
+static const std::vector<const std::string> kBootstrapApexes = {
+    "com.android.runtime",
+    "com.android.tzdata",
+};
+
 std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
                                            const std::string& loop) {
   AvbHashtreeDescriptor* desc = verity_data.desc.get();
@@ -311,7 +317,15 @@ Status mountNonFlattened(const ApexFile& apex, const std::string& mountPoint,
               MS_NOATIME | MS_NODEV | MS_DIRSYNC | MS_RDONLY, NULL) == 0) {
       LOG(INFO) << "Successfully mounted package " << full_path << " on "
                 << mountPoint;
-
+      // Verify the manifest inside the APEX filesystem matches the one outside
+      // it.
+      auto status = apex.VerifyManifestMatches(mountPoint);
+      if (!status.Ok()) {
+        umount2(mountPoint.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH);
+        return Status(StringLog()
+                      << "Failed to verify apex manifest for " << full_path
+                      << ": " << status.ErrorMessage());
+      }
       // Time to accept the temporaries as good.
       if (mountOnVerity) {
         verityDev.Release();
@@ -499,31 +513,18 @@ StatusOr<ApexFile> verifySessionDir(const int session_id) {
   return StatusOr<ApexFile>(std::move((*verified)[0]));
 }
 
-Status AbortNonFinalizedSessions() {
+Status ClearSessions() {
   auto sessions = ApexSession::GetSessions();
   int cnt = 0;
   for (ApexSession& session : sessions) {
-    Status status;
-    switch (session.GetState()) {
-      case SessionState::VERIFIED:
-        [[clang::fallthrough]];
-      case SessionState::STAGED:
-        cnt++;
-        status = session.DeleteSession();
-        if (!status.Ok()) {
-          return Status::Fail(status.ErrorMessage());
-        }
-        if (cnt > 1) {
-          LOG(WARNING) << "More than one non-finalized session!";
-        }
-        break;
-      // TODO(b/124215327): fail if session is in ACTIVATED state.
-      default:
-        break;
+    Status status = session.DeleteSession();
+    if (!status.Ok()) {
+      return status;
     }
+    cnt++;
   }
   if (cnt > 0) {
-    LOG(DEBUG) << "Aborted " << cnt << " non-finalized sessions";
+    LOG(DEBUG) << "Deleted " << cnt << " sessions";
   }
   return Status::Success();
 }
@@ -709,9 +710,24 @@ namespace apexd_private {
 
 Status MountPackage(const ApexFile& apex, const std::string& mountPoint) {
   LOG(VERBOSE) << "Creating mount point: " << mountPoint;
-  if (mkdir(mountPoint.c_str(), kMkdirMode) != 0) {
+  // Note: the mount point could exist in case when the APEX was activated
+  // during the bootstrap phase (e.g., the runtime or tzdata APEX).
+  // Although we have separate mount namespaces to separate the early activated
+  // APEXes from the normally activate APEXes, the mount points themselves
+  // are shared across the two mount namespaces because /apex (a tmpfs) itself
+  // mounted at / which is (and has to be) a shared mount. Therefore, if apexd
+  // finds an empty directory under /apex, it's not a problem and apexd can use
+  // it.
+  auto exists = PathExists(mountPoint);
+  if (!exists.Ok()) {
+    return exists.ErrorStatus();
+  }
+  if (!*exists && mkdir(mountPoint.c_str(), kMkdirMode) != 0) {
     return Status::Fail(PStringLog()
                         << "Could not create mount point " << mountPoint);
+  }
+  if (!IsEmptyDirectory(mountPoint)) {
+    return Status::Fail(PStringLog() << mountPoint << " is not empty");
   }
 
   MountedApexData data("", apex.GetPath());
@@ -820,39 +836,6 @@ Status resumeRollbackIfNeeded() {
   return Status::Success();
 }
 
-void startBootSequence() {
-  unmountAndDetachExistingImages();
-  scanStagedSessionsDirAndStage();
-  Status status = resumeRollbackIfNeeded();
-  if (!status.Ok()) {
-    LOG(ERROR) << "Failed to resume rollback : " << status.ErrorMessage();
-  }
-  // Scan the directory under /data first, as it may contain updates of APEX
-  // packages living in the directory under /system, and we want the former ones
-  // to be used over the latter ones.
-  status = scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
-  if (!status.Ok()) {
-    LOG(ERROR) << "Failed to activate packages from "
-               << kActiveApexPackagesDataDir << " : " << status.ErrorMessage();
-    Status rollback_status = rollbackLastSession();
-    if (rollback_status.Ok()) {
-      LOG(ERROR) << "Successfully rolled back. Time to reboot device.";
-      Reboot();
-    } else {
-      // TODO: should we kill apexd in this case?
-      LOG(ERROR) << "Failed to rollback : " << rollback_status.ErrorMessage();
-    }
-  }
-  // TODO(b/123622800): if activation failed, rollback and reboot.
-  status = scanPackagesDirAndActivate(kApexPackageSystemDir);
-  if (!status.Ok()) {
-    // This should never happen. Like **really** never.
-    // TODO: should we kill apexd in this case?
-    LOG(ERROR) << "Failed to activate packages from " << kApexPackageSystemDir
-               << " : " << status.ErrorMessage();
-  }
-}
-
 Status activatePackage(const std::string& full_path) {
   LOG(INFO) << "Trying to activate " << full_path;
 
@@ -861,6 +844,12 @@ Status activatePackage(const std::string& full_path) {
     return apexFile.ErrorStatus();
   }
   const ApexManifest& manifest = apexFile->GetManifest();
+
+  if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
+                              manifest.name()) == kBootstrapApexes.end()) {
+    LOG(INFO) << "Skipped when bootstrapping";
+    return Status::Success();
+  }
 
   // See whether we think it's active, and do not allow to activate the same
   // version. Also detect whether this is the highest version.
@@ -1004,8 +993,14 @@ void unmountAndDetachExistingImages() {
   // becomes an actual daemon. Remove if that's the case.
   LOG(INFO) << "Scanning " << kApexRoot
             << " looking for packages already mounted.";
+  // Find directories having apex manifest in it. This is to exclude
+  // the empty directories (mount points) that were created by the bootstrap
+  // apexd on the /apex tmpfs.
   StatusOr<std::vector<std::string>> folders_status =
-      ReadDir(kApexRoot, &DTypeFilter<DT_DIR>);
+      ReadDir(kApexRoot, [](unsigned char d_type, const char* d_name) {
+        return d_type == DT_DIR &&
+               ApexFile::Open(std::string(kApexRoot) + "/" + d_name).Ok();
+      });
   if (!folders_status.Ok()) {
     LOG(ERROR) << folders_status.ErrorMessage();
     return;
@@ -1248,12 +1243,8 @@ Status rollbackLastSession() {
   }
 }
 
-void onStart() {
-  LOG(INFO) << "Marking APEXd as starting";
-  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
-    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
-                << kApexStatusStarting;
-  }
+int onBootstrap() {
+  gBootstrap = true;
 
   // Scan /system/apex to get the number of (non-flattened) APEXes and
   // pre-allocated loopback devices so that we don't have to wait for it
@@ -1267,6 +1258,49 @@ void onStart() {
     if (!preAllocStatus.Ok()) {
       LOG(ERROR) << preAllocStatus.ErrorMessage();
     }
+  }
+
+  // Activate built-in APEXes for processes launched before /data is mounted.
+  scanPackagesDirAndActivate(kApexPackageSystemDir);
+  LOG(INFO) << "Bootstrapping done";
+  return 0;
+}
+
+void onStart() {
+  LOG(INFO) << "Marking APEXd as starting";
+  if (!android::base::SetProperty(kApexStatusSysprop, kApexStatusStarting)) {
+    PLOG(ERROR) << "Failed to set " << kApexStatusSysprop << " to "
+                << kApexStatusStarting;
+  }
+
+  // Activate APEXes from /data/apex. If one in the directory is newer than the
+  // system one, the new one will eclipse the old one.
+  scanStagedSessionsDirAndStage();
+  Status status = resumeRollbackIfNeeded();
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to resume rollback : " << status.ErrorMessage();
+  }
+
+  status = scanPackagesDirAndActivate(kActiveApexPackagesDataDir);
+  if (!status.Ok()) {
+    LOG(ERROR) << "Failed to activate packages from "
+               << kActiveApexPackagesDataDir << " : " << status.ErrorMessage();
+    Status rollback_status = rollbackLastSession();
+    if (rollback_status.Ok()) {
+      LOG(ERROR) << "Successfully rolled back. Time to reboot device.";
+      Reboot();
+    } else {
+      // TODO: should we kill apexd in this case?
+      LOG(ERROR) << "Failed to rollback : " << rollback_status.ErrorMessage();
+    }
+  }
+  // TODO(b/123622800): if activation failed, rollback and reboot.
+  status = scanPackagesDirAndActivate(kApexPackageSystemDir);
+  if (!status.Ok()) {
+    // This should never happen. Like **really** never.
+    // TODO: should we kill apexd in this case?
+    LOG(ERROR) << "Failed to activate packages from " << kApexPackageSystemDir
+               << " : " << status.ErrorMessage();
   }
 }
 
@@ -1285,7 +1319,7 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
-  Status cleanup_status = AbortNonFinalizedSessions();
+  Status cleanup_status = ClearSessions();
   if (!cleanup_status.Ok()) {
     return StatusOr<std::vector<ApexFile>>::MakeError(cleanup_status);
   }
