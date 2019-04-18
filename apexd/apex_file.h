@@ -75,10 +75,13 @@ class ApexFile {
   std::string apex_pubkey_;
 };
 
+StatusOr<std::vector<std::string>> FindApexes(
+    const std::vector<std::string>& paths);
 StatusOr<std::vector<std::string>> FindApexFilesByName(const std::string& path,
                                                        bool include_dirs);
 
 bool isPathForBuiltinApexes(const std::string& path);
+bool isFlattenedApex(const std::string& path);
 
 }  // namespace apex
 }  // namespace android

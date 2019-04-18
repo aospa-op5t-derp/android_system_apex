@@ -51,7 +51,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/loop.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -111,11 +110,50 @@ bool gInFsCheckpointMode = false;
 
 static constexpr size_t kLoopDeviceSetupAttempts = 3u;
 
+static const bool kUpdatable =
+    android::sysprop::ApexProperties::updatable().value_or(false);
+
 bool gBootstrap = false;
 static const std::vector<const std::string> kBootstrapApexes = {
     "com.android.runtime",
     "com.android.tzdata",
 };
+
+bool isBootstrapApex(const ApexFile& apex) {
+  return std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
+                   apex.GetManifest().name()) != kBootstrapApexes.end();
+}
+
+// Pre-allocate loop devices so that we don't have to wait for them
+// later when actually activating APEXes.
+Status preAllocateLoopDevices() {
+  auto scan = FindApexes({kApexPackageSystemDir, kApexPackageProductDir});
+  if (!scan.Ok()) {
+    return scan.ErrorStatus();
+  }
+
+  auto size = 0;
+  for (const auto& path : *scan) {
+    auto apexFile = ApexFile::Open(path);
+    if (!apexFile.Ok() || apexFile->IsFlattened()) {
+      continue;
+    }
+    size++;
+    // bootstrap Apexes may be activated on separate namespaces.
+    if (isBootstrapApex(*apexFile)) {
+      size++;
+    }
+  }
+
+  // note: do not call preAllocateLoopDevices() if size == 0.
+  // For devices (e.g. ARC) which doesn't support loop-control
+  // preAllocateLoopDevices() can cause problem when it tries
+  // to access /dev/loop-control.
+  if (size == 0) {
+    return Status::Success();
+  }
+  return loop::preAllocateLoopDevices(size);
+}
 
 std::unique_ptr<DmTable> createVerityTable(const ApexVerityData& verity_data,
                                            const std::string& loop,
@@ -427,6 +465,7 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
     return StatusM::MakeError(deviceStatus);
   }
 
+  // TODO: consider moving this inside RunVerifyFnInsideTempMount.
   if (mountOnVerity && verifyImage) {
     Status verityStatus =
         readVerityDevice(blockDevice, (*verityData).desc->image_size);
@@ -566,6 +605,39 @@ Status Unmount(const MountedApexData& data) {
   return Status::Success();
 }
 
+std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
+  return StringPrintf("%s.tmp",
+                      apexd_private::GetPackageMountPoint(manifest).c_str());
+}
+
+template <typename VerifyFn>
+Status RunVerifyFnInsideTempMount(const ApexFile& apex,
+                                  const VerifyFn& verify_fn) {
+  // Temp mount image of this apex to validate it was properly signed;
+  // this will also read the entire block device through dm-verity, so
+  // we can be sure there is no corruption.
+  const std::string& temp_mount_point =
+      GetPackageTempMountPoint(apex.GetManifest());
+
+  StatusOr<MountedApexData> mount_status =
+      VerifyAndTempMountPackage(apex, temp_mount_point);
+  if (!mount_status.Ok()) {
+    LOG(ERROR) << "Failed to temp mount to " << temp_mount_point << " : "
+               << mount_status.ErrorMessage();
+    return mount_status.ErrorStatus();
+  }
+  auto cleaner = [&]() {
+    LOG(DEBUG) << "Unmounting " << temp_mount_point;
+    Status status = Unmount(*mount_status);
+    if (!status.Ok()) {
+      LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
+                   << status.ErrorMessage();
+    }
+  };
+  auto scope_guard = android::base::make_scope_guard(cleaner);
+  return verify_fn(temp_mount_point);
+}
+
 template <typename HookFn, typename HookCall>
 Status PrePostinstallPackages(const std::vector<ApexFile>& apexes, HookFn fn,
                               HookCall call) {
@@ -620,21 +692,16 @@ RetType HandlePackages(const std::vector<std::string>& paths, Fn fn) {
 }
 
 Status ValidateStagingShimApex(const ApexFile& to) {
-  const std::string& package_name = to.GetManifest().name();
-  auto from = getActivePackage(package_name);
-  if (!from.Ok()) {
-    return Status::Fail(StringLog()
-                        << "Can't load active version of " << package_name
-                        << " : " << from.ErrorMessage());
+  using android::base::StringPrintf;
+  auto system_shim = ApexFile::Open(
+      StringPrintf("%s/%s", kApexPackageSystemDir, shim::kSystemShimApexName));
+  if (!system_shim.Ok()) {
+    return system_shim.ErrorStatus();
   }
-  std::string from_mount_point =
-      apexd_private::GetActiveMountPoint(from->GetManifest());
-  return shim::ValidateUpdate(from_mount_point, to.GetPath());
-}
-
-std::string GetPackageTempMountPoint(const ApexManifest& manifest) {
-  return StringPrintf("%s.tmp",
-                      apexd_private::GetPackageMountPoint(manifest).c_str());
+  auto verify_fn = [&](const std::string& system_apex_path) {
+    return shim::ValidateUpdate(system_apex_path, to.GetPath());
+  };
+  return RunVerifyFnInsideTempMount(*system_shim, verify_fn);
 }
 
 // A version of apex verification that happens during boot.
@@ -670,27 +737,17 @@ Status VerifyPackageInstall(const ApexFile& apex_file) {
   if (!verify_package_boot_status.Ok()) {
     return verify_package_boot_status;
   }
-  // Temp mount image of this apex to validate it was properly signed;
-  // this will also read the entire block device through dm-verity, so
-  // we can be sure there is no corruption.
-  const std::string& temp_mount_point =
-      GetPackageTempMountPoint(apex_file.GetManifest());
+  if (!kUpdatable) {
+    return Status::Fail(StringLog() << "Attempted to upgrade apex package "
+                                    << apex_file.GetPath()
+                                    << " on a device that doesn't support it");
+  }
+  StatusOr<ApexVerityData> verity_or = apex_file.VerifyApexVerity();
 
-  StatusOr<MountedApexData> mount_status =
-      VerifyAndTempMountPackage(apex_file, temp_mount_point);
-  if (!mount_status.Ok()) {
-    LOG(ERROR) << "Failed to temp mount to " << temp_mount_point << " : "
-               << mount_status.ErrorMessage();
-    return mount_status.ErrorStatus();
-  }
-  // TODO: move unmount inside scope guard.
-  LOG(DEBUG) << "Unmounting " << temp_mount_point;
-  Status status = Unmount(*mount_status);
-  if (!status.Ok()) {
-    LOG(WARNING) << "Failed to unmount " << temp_mount_point << " : "
-                 << status.ErrorMessage();
-  }
-  return Status::Success();
+  constexpr const auto kSuccessFn = [](const std::string& _) {
+    return Status::Success();
+  };
+  return RunVerifyFnInsideTempMount(apex_file, kSuccessFn);
 }
 
 template <typename VerifyApexFn>
@@ -1059,22 +1116,13 @@ Status resumeRollbackIfNeeded() {
   return Status::Success();
 }
 
-static bool IsApexUpdatable() {
-  static bool updatable =
-      android::sysprop::ApexProperties::updatable().value_or(false);
-  return updatable;
-}
-
 Status activatePackageImpl(const ApexFile& apex_file) {
   const ApexManifest& manifest = apex_file.GetManifest();
 
-  if (gBootstrap && std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
-                              manifest.name()) == kBootstrapApexes.end()) {
+  if (gBootstrap && !isBootstrapApex(apex_file)) {
     LOG(INFO) << "Skipped when bootstrapping";
     return Status::Success();
-  } else if (!IsApexUpdatable() && !gBootstrap &&
-             std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
-                       manifest.name()) != kBootstrapApexes.end()) {
+  } else if (!kUpdatable && !gBootstrap && isBootstrapApex(apex_file)) {
     LOG(INFO) << "Package already activated in bootstrap";
     return Status::Success();
   }
@@ -1641,18 +1689,10 @@ Status rollbackActiveSessionAndReboot() {
 int onBootstrap() {
   gBootstrap = true;
 
-  // Scan /system/apex to get the number of (non-flattened) APEXes and
-  // pre-allocated loopback devices so that we don't have to wait for it
-  // later when actually activating APEXes.
-  StatusOr<std::vector<std::string>> scan =
-      FindApexFilesByName(kApexPackageSystemDir, false /*include_dirs*/);
-  if (!scan.Ok()) {
-    LOG(WARNING) << scan.ErrorMessage();
-  } else if (scan->size() > 0) {
-    Status preAllocStatus = loop::preAllocateLoopDevices(scan->size());
-    if (!preAllocStatus.Ok()) {
-      LOG(ERROR) << preAllocStatus.ErrorMessage();
-    }
+  Status preAllocate = preAllocateLoopDevices();
+  if (!preAllocate.Ok()) {
+    LOG(ERROR) << "Failed to pre-allocate loop devices : "
+               << preAllocate.ErrorMessage();
   }
 
   Status status = collectApexKeys();
@@ -1718,6 +1758,8 @@ void onStart(CheckpointInterface* checkpoint_service) {
     LOG(ERROR) << "Failed to collect APEX keys : " << status.ErrorMessage();
     return;
   }
+
+  gMountedApexes.PopulateFromMounts();
 
   // Activate APEXes from /data/apex. If one in the directory is newer than the
   // system one, the new one will eclipse the old one.
