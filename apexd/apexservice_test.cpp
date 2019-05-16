@@ -844,8 +844,7 @@ TEST_F(ApexServiceTest, GetFactoryPackages) {
   ASSERT_TRUE(factoryPackages->size() > 0);
 
   for (const ApexInfo& package : *factoryPackages) {
-    ASSERT_TRUE(StartsWith(package.packagePath, kApexPackageSystemDir) ||
-                StartsWith(package.packagePath, kApexPackageProductDir));
+    ASSERT_TRUE(isPathForBuiltinApexes(package.packagePath));
   }
 }
 
@@ -2072,6 +2071,26 @@ TEST_F(ApexServiceTest, SubmitStagedSessionCorruptApexFails) {
   bool success;
   ASSERT_TRUE(IsOk(service_->submitStagedSession(57, {}, &list, &success)));
   ASSERT_FALSE(success);
+}
+
+// Following test case piggybacks on logic in ApexServiceActivationSuccessTest
+// in order to use mounted apex as flattened one.
+TEST_F(ApexServiceActivationSuccessTest, StageFailsFlattenedApex) {
+  ASSERT_TRUE(IsOk(service_->activatePackage(installer_->test_installed_file)))
+      << GetDebugStr(installer_.get());
+
+  StatusOr<ApexFile> flattened_apex =
+      ApexFile::Open(StringPrintf("/apex/%s", installer_->package.c_str()));
+  ASSERT_TRUE(IsOk(flattened_apex));
+  ASSERT_TRUE(flattened_apex->IsFlattened());
+
+  bool success;
+  const auto& status =
+      service_->stagePackage(flattened_apex->GetPath(), &success);
+  ASSERT_FALSE(IsOk(status));
+  const std::string& error_message =
+      std::string(status.exceptionMessage().c_str());
+  ASSERT_THAT(error_message, HasSubstr("Can't upgrade flattened apex"));
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {
