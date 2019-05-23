@@ -145,11 +145,12 @@ Status preAllocateLoopDevices() {
     }
   }
 
-  // note: do not call preAllocateLoopDevices() if size == 0.
+  // note: do not call preAllocateLoopDevices() if size == 0
+  // or the device does not support updatable APEX.
   // For devices (e.g. ARC) which doesn't support loop-control
   // preAllocateLoopDevices() can cause problem when it tries
   // to access /dev/loop-control.
-  if (size == 0) {
+  if (size == 0 || !kUpdatable) {
     return Status::Success();
   }
   return loop::preAllocateLoopDevices(size);
@@ -313,11 +314,6 @@ StatusOr<DmVerityDevice> createVerityDevice(const std::string& name,
   dev.SetDevPath(dev_path);
 
   return StatusOr<DmVerityDevice>(std::move(dev));
-}
-
-template <char kTypeVal>
-bool DTypeFilter(unsigned char d_type, const char* d_name ATTRIBUTE_UNUSED) {
-  return d_type == kTypeVal;
 }
 
 Status RemovePreviouslyActiveApexFiles(
@@ -1301,50 +1297,6 @@ Status abortActiveSession() {
   }
 }
 
-void unmountAndDetachExistingImages() {
-  // TODO: this procedure should probably not be needed anymore when apexd
-  // becomes an actual daemon. Remove if that's the case.
-  LOG(INFO) << "Scanning " << kApexRoot
-            << " looking for packages already mounted.";
-  // Find directories having apex manifest in it. This is to exclude
-  // the empty directories (mount points) that were created by the bootstrap
-  // apexd on the /apex tmpfs.
-  StatusOr<std::vector<std::string>> folders_status =
-      ReadDir(kApexRoot, [](const std::filesystem::directory_entry& entry) {
-        std::error_code ec;
-        return entry.is_directory(ec) &&
-               ApexFile::Open(std::string(kApexRoot) + "/" +
-                              entry.path().filename().string())
-                   .Ok();
-      });
-  if (!folders_status.Ok()) {
-    LOG(ERROR) << folders_status.ErrorMessage();
-    return;
-  }
-
-  // Sort the folders. This way, the "latest" folder will appear before any
-  // versioned folder, so we'll unmount the bind-mount first.
-  std::vector<std::string>& folders = *folders_status;
-  std::sort(folders.begin(), folders.end());
-
-  for (const std::string& full_path : folders) {
-    LOG(INFO) << "Unmounting " << full_path;
-    // Lazily try to umount whatever is mounted.
-    if (umount2(full_path.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) != 0 &&
-        errno != EINVAL && errno != ENOENT) {
-      PLOG(ERROR) << "Failed to unmount directory " << full_path;
-    }
-    // Attempt to delete the folder. If the folder is retained, other
-    // data may be incorrect.
-    // TODO: Fix this.
-    if (rmdir(full_path.c_str()) != 0) {
-      PLOG(ERROR) << "Failed to rmdir directory " << full_path;
-    }
-  }
-
-  loop::destroyAllLoopDevices();
-}
-
 Status scanPackagesDirAndActivate(const char* apex_package_dir) {
   LOG(INFO) << "Scanning " << apex_package_dir << " looking for APEX packages.";
 
@@ -1793,12 +1745,27 @@ void onAllPackagesReady() {
 
 StatusOr<std::vector<ApexFile>> submitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids) {
+  bool needsBackup = true;
   Status cleanup_status = ClearSessions();
   if (!cleanup_status.Ok()) {
     return StatusOr<std::vector<ApexFile>>::MakeError(cleanup_status);
   }
 
-  if (!gSupportsFsCheckpoints) {
+  if (gSupportsFsCheckpoints) {
+    Status checkpoint_status =
+        gVoldService->StartCheckpoint(1 /* numRetries */);
+    if (!checkpoint_status.Ok()) {
+      // The device supports checkpointing, but we could not start it;
+      // log a warning, but do continue, since we can live without it.
+      LOG(WARNING) << "Failed to start filesystem checkpoint on device that "
+                      "should support it: "
+                   << checkpoint_status.ErrorMessage();
+    } else {
+      needsBackup = false;
+    }
+  }
+
+  if (needsBackup) {
     Status backup_status = BackupActivePackages();
     if (!backup_status.Ok()) {
       return StatusOr<std::vector<ApexFile>>::MakeError(backup_status);
