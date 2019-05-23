@@ -119,6 +119,8 @@ static const std::vector<const std::string> kBootstrapApexes = {
     "com.android.tzdata",
 };
 
+static constexpr const int kNumRetriesWhenCheckpointingEnabled = 1;
+
 bool isBootstrapApex(const ApexFile& apex) {
   return std::find(kBootstrapApexes.begin(), kBootstrapApexes.end(),
                    apex.GetManifest().name()) != kBootstrapApexes.end();
@@ -397,6 +399,12 @@ StatusOr<MountedApexData> mountNonFlattened(const ApexFile& apex,
                                             bool verifyImage) {
   using StatusM = StatusOr<MountedApexData>;
   const std::string& full_path = apex.GetPath();
+
+  if (!kUpdatable) {
+    return StatusM::Fail(StringLog()
+                         << "Unable to mount non-flattened apex package "
+                         << full_path << " because device doesn't support it");
+  }
 
   loop::LoopbackDeviceUniqueFd loopbackDevice;
   for (size_t attempts = 1;; ++attempts) {
@@ -1311,6 +1319,8 @@ Status scanPackagesDirAndActivate(const char* apex_package_dir) {
   const auto& packages_with_code = GetActivePackagesMap();
 
   std::vector<std::string> failed_pkgs;
+  size_t activated_cnt = 0;
+  size_t skipped_cnt = 0;
   for (const std::string& name : *scan) {
     LOG(INFO) << "Found " << name;
 
@@ -1329,6 +1339,14 @@ Status scanPackagesDirAndActivate(const char* apex_package_dir) {
       LOG(INFO) << "Skipping activation of " << name
                 << " same package with higher version " << it->second
                 << " is already active";
+      skipped_cnt++;
+      continue;
+    }
+
+    if (!kUpdatable && !apex_file->IsFlattened()) {
+      LOG(INFO) << "Skipping activation of non-flattened apex package " << name
+                << " because device doesn't support it";
+      skipped_cnt++;
       continue;
     }
 
@@ -1337,6 +1355,8 @@ Status scanPackagesDirAndActivate(const char* apex_package_dir) {
       LOG(ERROR) << "Failed to activate " << name << " : "
                  << res.ErrorMessage();
       failed_pkgs.push_back(name);
+    } else {
+      activated_cnt++;
     }
   }
 
@@ -1346,7 +1366,8 @@ Status scanPackagesDirAndActivate(const char* apex_package_dir) {
                         << Join(failed_pkgs, ','));
   }
 
-  LOG(INFO) << "Activated " << scan->size() << " packages";
+  LOG(INFO) << "Activated " << activated_cnt
+            << " packages. Skipped: " << skipped_cnt;
   return Status::Success();
 }
 
@@ -1586,12 +1607,19 @@ Status unstagePackages(const std::vector<std::string>& paths) {
 
 Status rollbackStagedSessionIfAny() {
   auto session = ApexSession::GetActiveSession();
-  if (session.Ok() && session->has_value() &&
-      (*session)->GetState() == SessionState::STAGED) {
-    return RollbackStagedSession(*(*session));
+  if (!session.Ok()) {
+    return session.ErrorStatus();
   }
-
-  return Status::Success();
+  if (!session->has_value()) {
+    LOG(WARNING) << "No session to rollback";
+    return Status::Success();
+  }
+  if ((*session)->GetState() == SessionState::STAGED) {
+    LOG(INFO) << "Rolling back session " << **session;
+    return RollbackStagedSession(**session);
+  }
+  return Status::Fail(StringLog() << "Can't rollback " << **session
+                                  << " because it is not in STAGED state");
 }
 
 Status rollbackActiveSession() {
@@ -1682,6 +1710,9 @@ void onStart(CheckpointInterface* checkpoint_service) {
       LOG(ERROR) << "Failed to check if we need a rollback: "
                  << needs_rollback.ErrorMessage();
     } else if (*needs_rollback) {
+      LOG(INFO) << "Exceeded number of session retries ("
+                << kNumRetriesWhenCheckpointingEnabled
+                << "). Starting a rollback";
       Status status = rollbackStagedSessionIfAny();
       if (!status.Ok()) {
         LOG(ERROR)
@@ -1753,7 +1784,7 @@ StatusOr<std::vector<ApexFile>> submitStagedSession(
 
   if (gSupportsFsCheckpoints) {
     Status checkpoint_status =
-        gVoldService->StartCheckpoint(1 /* numRetries */);
+        gVoldService->StartCheckpoint(kNumRetriesWhenCheckpointingEnabled);
     if (!checkpoint_status.Ok()) {
       // The device supports checkpointing, but we could not start it;
       // log a warning, but do continue, since we can live without it.
