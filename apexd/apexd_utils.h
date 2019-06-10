@@ -82,37 +82,39 @@ inline int ForkAndRun(const std::vector<std::string>& args,
   return rc;
 }
 
+template <typename Fn>
+Status WalkDir(const std::string& path, Fn fn) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  auto it = fs::directory_iterator(path, ec);
+  auto end = fs::directory_iterator();
+  while (!ec && it != end) {
+    fn(*it);
+    it.increment(ec);
+  }
+  if (ec) {
+    return Status::Fail(StringLog() << "Can't open " << path
+                                    << " for reading : " << ec.message());
+  }
+  return Status::Success();
+}
+
 template <typename FilterFn>
 StatusOr<std::vector<std::string>> ReadDir(const std::string& path,
                                            FilterFn fn) {
   namespace fs = std::filesystem;
-  fs::path file_path = path;
-  std::error_code ec;
-
-  if (!fs::is_directory(file_path, ec)) {
-    return StatusOr<std::vector<std::string>>::MakeError(
-        StringLog() << "Can't open " << path << " for reading : " << ec);
-  }
+  using Status = StatusOr<std::vector<std::string>>;
 
   std::vector<std::string> ret;
-  auto iter = fs::directory_iterator(file_path, ec);
-  if (ec) {
-    return StatusOr<std::vector<std::string>>::MakeError(
-        StringLog() << "Can't open " << path << " for reading: " << ec);
-  }
-  while (iter != fs::end(iter)) {
-    if (fn(*iter)) {
-      ret.push_back(file_path.string() + "/" +
-                    iter->path().filename().string());
+  auto status = WalkDir(path, [&](const fs::directory_entry& entry) {
+    if (fn(entry)) {
+      ret.push_back(entry.path());
     }
-    iter = iter.increment(ec);
-    if (ec) {
-      return StatusOr<std::vector<std::string>>::MakeError(
-          StringLog() << "Failed to iterate " << path << ": " << ec);
-    }
+  });
+  if (!status.Ok()) {
+    return Status::Fail(status.ErrorMessage());
   }
-
-  return StatusOr<std::vector<std::string>>(std::move(ret));
+  return Status(std::move(ret));
 }
 
 inline bool IsEmptyDirectory(const std::string& path) {
@@ -162,17 +164,18 @@ inline Status DeleteDirContent(const std::string& path) {
 
 inline StatusOr<bool> PathExists(const std::string& path) {
   namespace fs = std::filesystem;
+  using Status = StatusOr<bool>;
 
   std::error_code ec;
   if (!fs::exists(fs::path(path), ec)) {
     if (ec) {
-      return StatusOr<bool>::MakeError(StringLog() << "Failed to access "
-                                                   << path << " : " << ec);
+      return Status::Fail(StringLog() << "Failed to access " << path << " : "
+                                      << ec.message());
     } else {
-      return StatusOr<bool>(false);
+      return Status(false);
     }
   }
-  return StatusOr<bool>(true);
+  return Status(true);
 }
 
 inline void Reboot() {
